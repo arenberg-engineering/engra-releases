@@ -61,19 +61,23 @@ REPO_ALLOWED = frozenset(
 # This file defines the patterns below, so it is the one file not scanned.
 SELF = "scripts/check_distribution.py"
 
+# A strict superset of the rules in the former check-release-assets.sh and
+# content-check.yml (no word boundaries, so nothing they caught slips past).
 _SECRET_PATTERNS: tuple[tuple[str, bytes], ...] = (
-    ("private key", rb"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----"),
-    ("Stripe secret/restricted key", rb"\b[sr]k_(?:live|test)_[0-9A-Za-z]{10,}"),
-    ("AWS access key id", rb"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
-    ("GitHub token", rb"\bgh[pousr]_[A-Za-z0-9]{30,}"),
-    ("GitHub fine-grained token", rb"\bgithub_pat_[A-Za-z0-9_]{40,}"),
-    ("Google API key", rb"\bAIza[0-9A-Za-z_\-]{35}"),
-    ("Slack token", rb"\bxox[abprs]-[0-9A-Za-z\-]{10,}"),
+    ("private key", rb"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
+    ("Stripe secret/restricted key", rb"[sr]k_(?:live|test)_[0-9A-Za-z]{10,}"),
+    ("AWS access key id", rb"(?:AKIA|ASIA)[0-9A-Z]{16}"),
+    ("GitHub token", rb"gh[pousr]_[A-Za-z0-9]{30,}"),
+    ("GitHub fine-grained token", rb"github_pat_[A-Za-z0-9_]{40,}"),
+    ("Google API key", rb"AIza[0-9A-Za-z_\-]{35}"),
+    ("Slack token", rb"xox[abprs]-[0-9A-Za-z\-]{10,}"),
     ("GCP service-account JSON", rb'"type"\s*:\s*"service_account"'),
     ("private_key_id field", rb'"private_key_id"\s*:'),
-    ("Cloud Run URL", rb"[a-z0-9-]+\.run\.app\b"),
+    ("Cloud Run URL", rb"[a-z0-9-]+\.run\.app"),
+    ("internal host", rb"[a-z0-9.-]+\.internal\b"),
     ("GCE metadata endpoint", rb"metadata\.google\.internal"),
-    ("internal project name", rb"\bengra-prod\b"),
+    ("internal project name", rb"engra-prod"),
+    ("loopback URL", rb"127\.0\.0\.1:[0-9]{2,5}/"),
 )
 SECRETS = tuple((label, re.compile(rx)) for label, rx in _SECRET_PATTERNS)
 
@@ -329,6 +333,55 @@ def selftest() -> None:
         (repo / "TERMS.md").write_text(sa)
         subprocess.run(["git", "-C", str(repo), "add", "--", "TERMS.md"], check=True)
         must_fail("service-account JSON in TERMS.md", lambda: check_repo(repo))
+        # 8. Rule parity with the former shell check: every pattern it had
+        #    (and the narrower-looking variants) is still caught, including
+        #    inside a longer word.
+        samples = {
+            "private key": "-----BEGIN " + "RSA PRIVATE KEY-----",
+            "github": "x" + "ghp_" + "a" * 36,
+            "github pat": "github_pat_" + "b" * 50,
+            "aws": "x" + "AKIA" + "ABCDEFGHIJKLMNOP" + "Q",
+            "google": "x" + "AIza" + "c" * 35,
+            "slack": "xox" + "b-" + "1234567890ab",
+            "stripe": "x" + "sk_" + "live_" + "d" * 12,
+            "cloud run": "https://svc-123" + ".run.app/x",
+            "internal": "db.corp" + ".internal",
+            "metadata": "metadata.google" + ".internal",
+            "project": "engra" + "-prod",
+            "loopback": "http://127.0.0.1" + ":8099/v1",
+        }
+        for label, text in samples.items():
+            must_fail(f"pattern parity: {label}", lambda t=text: scan_bytes("sample", t.encode()))
+
+        # 9. The real CI entrypoints, run as CI runs them, exit non-zero on a
+        #    deliberately bad tree and a deliberately bad bundle.
+        script = str(Path(__file__).resolve())
+        bad_repo = d / "bad-repo"
+        bad_repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(bad_repo)], check=True)
+        (bad_repo / "README.md").write_text("ok\n")
+        (bad_repo / "server.py").write_text("import os\n")
+        subprocess.run(["git", "-C", str(bad_repo), "add", "--", "."], check=True)
+        rc = subprocess.run([sys.executable, script, "repo"], cwd=bad_repo, check=False).returncode
+        if rc == 0:
+            raise SystemExit("[selftest] FAIL: `repo` entrypoint accepted a tree with server.py")
+        print(f"[selftest] `repo` entrypoint exits {rc} on a bad tree")
+        (d / "SHA256SUMS").unlink()
+        rc = subprocess.run(
+            [sys.executable, script, "assets", "--version", version, "--dir", str(d)],
+            check=False,
+        ).returncode
+        if rc == 0:
+            raise SystemExit("[selftest] FAIL: `assets` entrypoint accepted a bundle missing SHA256SUMS")
+        print(f"[selftest] `assets` entrypoint exits {rc} on a bad bundle")
+        (d / "broken.json").write_text("{not json")
+        rc = subprocess.run(
+            [sys.executable, script, "release", "--version", version, "--json", str(d / "broken.json")],
+            check=False,
+        ).returncode
+        if rc == 0:
+            raise SystemExit("[selftest] FAIL: `release` entrypoint accepted unparsable JSON")
+        print(f"[selftest] `release` entrypoint exits {rc} on unparsable JSON")
     print("[selftest] OK")
 
 
