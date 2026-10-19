@@ -1,0 +1,16 @@
+Engra CLI
+Copyright (c) 2026 Arenberg AG. All rights reserved.
+
+This software is proprietary to Arenberg AG and is licensed, not sold. You
+may use it only under the Engra CLI Terms of Use (TERMS.md, distributed with
+this software and shown by `engra legal --terms`) and any written agreement
+you have with Arenberg AG. No other rights are granted, whether by
+implication, estoppel or otherwise.
+
+You may not copy (except as the Terms of Use allow), modify, reverse
+engineer, decompile, disassemble, redistribute, sublicense, rent or lease
+this software, except to the extent applicable law expressly permits it
+despite this restriction.
+
+This software includes third-party components under their own licenses. See
+THIRD_PARTY_NOTICES.txt (or run `engra legal --third-party`).

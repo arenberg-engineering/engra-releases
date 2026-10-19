@@ -1,0 +1,27 @@
+# This repository holds distribution material only. Fails closed on anything
+# else: source code, credentials, internal endpoints or unexpected files.
+# The rules live in scripts/check_distribution.py, which also proves with a
+# self-test that the known bypasses fail.
+name: content-check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  content:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Repository inventory (git index) and content scan
+        run: python3 scripts/check_distribution.py repo
+      - name: Self-test (newline names, lookalikes, hidden archive members, secrets)
+        run: python3 scripts/check_distribution.py selftest
+      - name: shellcheck
+        run: shellcheck scripts/supersede-release.sh
