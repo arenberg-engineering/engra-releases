@@ -1,0 +1,235 @@
+# Publish an Engra CLI release that CI has already built, signed and tested.
+#
+# Started by hand for one tag. The job runs in the `release-publish`
+# environment, so a required reviewer must approve every run before any
+# secret is available. It then:
+#   1. checks that the source `cli-release` run is a successful tag-push run of
+#      that exact tag, whose commit is on the source repository's main branch;
+#   2. downloads that run's `release-bundle` and checks its checksums, asset
+#      set, build info and macOS notarization status;
+#   3. attests provenance for every asset (verifiable by anyone with
+#      `gh attestation verify <asset> --repo arenberg-engineering/engra-releases`);
+#   4. creates the GitHub Release (never overwrites an existing one);
+#   5. checks the published URLs serve the expected hashes, and opens a pull
+#      request to arenberg-engineering/homebrew-tap with the generated formula.
+#      It never pushes to the tap's main branch.
+#
+# Environment secrets (release-publish only, referenced by name):
+#   ENGRA_SOURCE_REPO        owner/name of the source repository (kept secret so
+#                            it never appears in this public repository or logs)
+#   ENGRA_SOURCE_READ_TOKEN  fine-grained token: that repository only,
+#                            Actions read + Contents read
+#   HOMEBREW_TAP_TOKEN       fine-grained token or GitHub App: homebrew-tap only,
+#                            Contents read/write + Pull requests read/write
+name: publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (vX.Y.Z)"
+        required: true
+        type: string
+      run_id:
+        description: "cli-release run id (optional; default: latest successful run for the tag)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  TAP_REPO: arenberg-engineering/homebrew-tap
+  PLATFORMS: "macos-arm64 macos-x64 linux-x64 linux-arm64 windows-x64"
+  BREW_PLATFORMS: "macos-arm64 macos-x64 linux-x64 linux-arm64"
+
+jobs:
+  publish:
+    name: publish ${{ inputs.tag }}
+    runs-on: ubuntu-24.04
+    environment: release-publish
+    permissions:
+      contents: write # create the release in this repository
+      id-token: write # provenance signing
+      attestations: write
+    steps:
+      - name: Validate inputs
+        id: inputs
+        env:
+          TAG: ${{ inputs.tag }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::tag must be vX.Y.Z"; exit 1
+          fi
+          if [[ -n "$RUN_ID" && ! "$RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::run_id must be numeric"; exit 1
+          fi
+          {
+            echo "tag=$TAG"
+            echo "version=${TAG#v}"
+            echo "run_id=$RUN_ID"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Verify the source run
+        id: source
+        env:
+          GH_TOKEN: ${{ secrets.ENGRA_SOURCE_READ_TOKEN }}
+          SRC: ${{ secrets.ENGRA_SOURCE_REPO }}
+          TAG: ${{ steps.inputs.outputs.tag }}
+          RUN_ID: ${{ steps.inputs.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SRC:-}" || -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::ENGRA_SOURCE_REPO and ENGRA_SOURCE_READ_TOKEN must be set in the release-publish environment"
+            exit 1
+          fi
+          # Resolve the tag to its commit (dereference annotated tags).
+          read -r obj_type obj_sha < <(gh api "repos/$SRC/git/ref/tags/$TAG" --jq '.object.type + " " + .object.sha')
+          if [[ "$obj_type" == "tag" ]]; then
+            commit="$(gh api "repos/$SRC/git/tags/$obj_sha" --jq '.object.sha')"
+          else
+            commit="$obj_sha"
+          fi
+          if [[ -z "$RUN_ID" ]]; then
+            RUN_ID="$(gh api "repos/$SRC/actions/workflows/cli-release.yml/runs?event=push&branch=$TAG&status=success&per_page=1" --jq '.workflow_runs[0].id // empty')"
+            [[ -n "$RUN_ID" ]] || { echo "::error::no successful cli-release run for $TAG"; exit 1; }
+          fi
+          gh api "repos/$SRC/actions/runs/$RUN_ID" >run.json
+          jq -e --arg tag "$TAG" --arg sha "$commit" '
+            .path == ".github/workflows/cli-release.yml" and
+            .event == "push" and .head_branch == $tag and
+            .status == "completed" and .conclusion == "success" and
+            .head_sha == $sha' run.json >/dev/null || {
+            echo "::error::run $RUN_ID is not a successful cli-release tag-push run of $TAG at the tag commit"
+            exit 1
+          }
+          # The tag commit must be on main: main is identical to or ahead of it.
+          rel="$(gh api "repos/$SRC/compare/$commit...main" --jq '.status')"
+          if [[ "$rel" != "identical" && "$rel" != "ahead" ]]; then
+            echo "::error::tag commit is not on the source main branch (compare: $rel)"
+            exit 1
+          fi
+          rm -f run.json
+          echo "run_id=$RUN_ID" >>"$GITHUB_OUTPUT"
+          echo "commit=$commit" >>"$GITHUB_OUTPUT"
+          echo "source run $RUN_ID verified for $TAG at $commit"
+
+      - name: Download the release bundle
+        env:
+          GH_TOKEN: ${{ secrets.ENGRA_SOURCE_READ_TOKEN }}
+          SRC: ${{ secrets.ENGRA_SOURCE_REPO }}
+          RUN_ID: ${{ steps.source.outputs.run_id }}
+        run: gh run download "$RUN_ID" --repo "$SRC" --name release-bundle --dir bundle
+
+      - name: Verify the bundle
+        working-directory: bundle
+        env:
+          SRC: ${{ secrets.ENGRA_SOURCE_REPO }}
+          TAG: ${{ steps.inputs.outputs.tag }}
+          VERSION: ${{ steps.inputs.outputs.version }}
+          COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          set -euo pipefail
+          sha256sum -c SHA256SUMS
+          jq -e --arg v "$VERSION" --arg t "$TAG" --arg c "$COMMIT" \
+            '.version == $v and .tag == $t and .source_commit == $c and .release == true' \
+            build-info.json >/dev/null || { echo "::error::build-info.json does not match $TAG"; exit 1; }
+          for p in $PLATFORMS; do
+            asset="engra-$VERSION-$p"; [[ "$p" == windows-* ]] && asset="$asset.zip"
+            for f in "$asset" "engra-$VERSION-$p.cdx.json" "engra-$VERSION-$p.spdx.json"; do
+              grep -q "  $f\$" SHA256SUMS || { echo "::error::$f missing from SHA256SUMS"; exit 1; }
+            done
+          done
+          for p in macos-arm64 macos-x64; do
+            jq -e --arg p "$p" '.platforms[$p].signed == true and .platforms[$p].notarized == true' \
+              signing-status.json >/dev/null || { echo "::error::$p is not signed and notarized"; exit 1; }
+          done
+          # Corporate-identity rule: the source owner never appears in public assets.
+          owner="${SRC%%/*}"
+          if grep -rqiF -- "$owner" --include='*.json' --include='*.md' --include='*.rb' --include=SHA256SUMS .; then
+            echo "::error::a release text file names the source repository owner"; exit 1
+          fi
+          jq -r '.platforms | to_entries[] | "\(.key): signed=\(.value.signed) notarized=\(.value.notarized)"' signing-status.json
+
+      - name: Refuse to overwrite an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.inputs.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release $TAG already exists; releases are never overwritten"
+            exit 1
+          fi
+
+      - name: Attest provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            bundle/engra-*
+            bundle/SHA256SUMS
+            bundle/signing-status.json
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.inputs.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(bundle/engra-* bundle/SHA256SUMS bundle/signing-status.json)
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target main \
+            --title "Engra CLI $TAG" --notes-file bundle/RELEASE_NOTES.md --latest \
+            "${assets[@]}"
+
+      - name: Published URLs serve the expected hashes
+        env:
+          VERSION: ${{ steps.inputs.outputs.version }}
+          TAG: ${{ steps.inputs.outputs.tag }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          for p in $BREW_PLATFORMS; do
+            name="engra-$VERSION-$p"
+            want="$(awk -v n="$name" '$2 == n { print $1 }' bundle/SHA256SUMS)"
+            grep -q "url \"$base/$name\"" bundle/engra.rb
+            grep -q "sha256 \"$want\"" bundle/engra.rb
+            got=""
+            for _ in 1 2 3 4 5; do
+              got="$(curl -fsSL "$base/$name" | sha256sum | cut -d' ' -f1)" && [[ "$got" == "$want" ]] && break
+              sleep 10
+            done
+            [[ "$got" == "$want" ]] || { echo "::error::$name hash mismatch at $base"; exit 1; }
+            echo "$name OK"
+          done
+
+      - name: Open the Homebrew tap pull request
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ steps.inputs.outputs.version }}
+          TAG: ${{ steps.inputs.outputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ -n "${GH_TOKEN:-}" ]] || { echo "::error::HOMEBREW_TAP_TOKEN is not set"; exit 1; }
+          branch="engra-$VERSION"
+          if gh api "repos/$TAP_REPO/branches/$branch" >/dev/null 2>&1; then
+            echo "::error::$TAP_REPO already has branch $branch"; exit 1
+          fi
+          gh auth setup-git
+          gh repo clone "$TAP_REPO" tap -- --depth 1
+          cd tap
+          git switch -c "$branch"
+          cp ../bundle/engra.rb Formula/engra.rb
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/engra.rb
+          git commit -m "engra $VERSION"
+          git push origin "$branch"
+          gh pr create --repo "$TAP_REPO" --base main --head "$branch" \
+            --title "engra $VERSION" \
+            --body "Generated by the engra-releases publish workflow for [$TAG](https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG). Every URL and sha256 was checked against the published release and its SHA256SUMS. After merging, run the brew-acceptance workflow for $VERSION."
