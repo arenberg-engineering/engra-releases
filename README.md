@@ -1,21 +1,35 @@
 # Engra Releases
 
-Official release distribution for the Engra CLI: signed binaries, checksums,
-SBOMs and provenance. Every release here is built, signed and tested by CI,
-then published by the [`publish`](.github/workflows/publish.yml) workflow after
-a maintainer approves it.
+Official distribution of the Engra CLI: signed release archives, checksums,
+SBOMs, license files and provenance. CI builds, signs and tests every release
+here. The [`publish`](.github/workflows/publish.yml) workflow publishes it
+after a maintainer approves.
+
+This repository holds distribution material only. The
+[`content-check`](.github/workflows/content-check.yml) workflow fails on
+anything else.
+
+## License
+
+The Engra CLI is proprietary software of Arenberg AG. See
+[LICENSE.txt](LICENSE.txt) and the Engra CLI Terms of Use,
+[TERMS.md](TERMS.md) (**DRAFT**, pending owner and legal review). Each
+release lists its open-source components and their licenses in
+`THIRD_PARTY_NOTICES-<platform>.txt`. Run `engra legal --third-party` to see
+them.
 
 ## Install
 
 ### macOS and Linux (Homebrew)
 
 ```bash
-brew tap arenberg-engineering/tap
-brew install engra
+brew install arenberg-engineering/tap/engra
 engra --version
 ```
 
-Update with `brew upgrade engra`.
+The fully qualified name taps `arenberg-engineering/tap` and trusts the
+formula, as Homebrew 6 requires for third-party taps. Update with
+`brew upgrade engra`.
 
 ### Linux without Homebrew
 
@@ -23,10 +37,11 @@ Update with `brew upgrade engra`.
 VERSION=0.2.0
 ARCH=x64                     # or arm64
 BASE=https://github.com/arenberg-engineering/engra-releases/releases/download/v$VERSION
-curl -fLO "$BASE/engra-$VERSION-linux-$ARCH"
+curl -fLO "$BASE/engra-$VERSION-linux-$ARCH.tar.gz"
 curl -fLO "$BASE/SHA256SUMS"
 sha256sum -c SHA256SUMS --ignore-missing
-install -m 755 "engra-$VERSION-linux-$ARCH" ~/.local/bin/engra
+tar -xzf "engra-$VERSION-linux-$ARCH.tar.gz"
+install -m 755 "engra-$VERSION-linux-$ARCH/engra" ~/.local/bin/engra
 ```
 
 The Linux builds need glibc 2.35 or newer.
@@ -35,11 +50,12 @@ The Linux builds need glibc 2.35 or newer.
 
 1. Download `engra-<version>-windows-x64.zip` and `SHA256SUMS` from the
    [latest release](https://github.com/arenberg-engineering/engra-releases/releases/latest).
-2. Check the hash:
-   `(Get-FileHash .\engra-<version>-windows-x64.zip -Algorithm SHA256).Hash.ToLower()`
-   must match its line in `SHA256SUMS`.
-3. Unpack it to a folder on your `PATH`, for example
-   `%LOCALAPPDATA%\Programs\engra`, and run `engra --version`.
+2. Check the zip's hash:
+   `(Get-FileHash .\engra-<version>-windows-x64.zip -Algorithm SHA256).Hash.ToLower()`.
+   It must match the zip's line in `SHA256SUMS`.
+3. Unpack it. The archive holds the folder `engra-<version>-windows-x64\`,
+   which contains `engra.exe`. Put that folder on your `PATH`, then run
+   `engra --version`.
 
 Each release's notes say whether the Windows build is Authenticode-signed.
 
@@ -47,17 +63,16 @@ Each release's notes say whether the Windows build is Authenticode-signed.
 
 ```bash
 shasum -a 256 -c SHA256SUMS --ignore-missing        # sha256sum on Linux
-gh attestation verify engra-<version>-macos-arm64 --repo arenberg-engineering/engra-releases
-spctl --assess --type install -vvv engra-<version>-macos-arm64   # macOS: Notarized Developer ID
+gh attestation verify engra-<version>-macos-arm64.tar.gz --repo arenberg-engineering/engra-releases
+tar -xzf engra-<version>-macos-arm64.tar.gz
+spctl --assess --type install -vvv engra-<version>-macos-arm64/engra   # Notarized Developer ID
 ```
-
-Each platform has a CycloneDX (`.cdx.json`) and an SPDX (`.spdx.json`) SBOM.
 
 ## Uninstall
 
 ```bash
-engra logout                 # removes saved tokens from the OS keychain
+engra logout                 # revokes the session and removes saved tokens
 brew uninstall engra
 brew untap arenberg-engineering/tap
-rm -rf ~/.config/engra       # optional: configuration and link state
+rm -rf ~/.config/engra ~/.engra   # optional: settings and doctor records
 ```

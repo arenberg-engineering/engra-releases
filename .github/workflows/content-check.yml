@@ -1,0 +1,61 @@
+# This repository holds distribution material only. Fails on anything else:
+# source code, credentials, internal endpoints or unexpected files.
+name: content-check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  content:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Only distribution files are tracked
+        run: |
+          set -euo pipefail
+          bad=0
+          while IFS= read -r f; do
+            case "$f" in
+              README.md | LICENSE.txt | TERMS.md | .github/dependabot.yml) ;;
+              .github/workflows/*.yml) ;;
+              scripts/check-release-assets.sh | scripts/supersede-release.sh) ;;
+              *) echo "::error file=$f::not allowed in the distribution repository: $f"; bad=1 ;;
+            esac
+          done < <(git ls-files)
+          exit "$bad"
+      - name: No credentials or internal endpoints
+        run: |
+          set -euo pipefail
+          re='(-----BEGIN [A-Z ]*PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|xox[abprs]-[0-9A-Za-z-]{10,}|sk_live_[0-9A-Za-z]{10,}|[a-z0-9-]+\.run\.app|metadata\.google\.internal|engra-prod)'
+          # The two files that define these patterns are excluded from the scan.
+          if git ls-files -z -- . ':!.github/workflows/content-check.yml' ':!scripts/check-release-assets.sh' |
+            xargs -0 grep -EIn "$re"; then
+            echo "::error::credential-like string or internal endpoint found"
+            exit 1
+          fi
+      - name: Release-asset allowlist accepts the real set and rejects others
+        run: |
+          set -euo pipefail
+          shellcheck scripts/*.sh
+          d="$(mktemp -d)"
+          for p in macos-arm64 macos-x64 linux-x64 linux-arm64; do touch "$d/engra-0.2.0-$p.tar.gz"; done
+          touch "$d/engra-0.2.0-windows-x64.zip"
+          for p in macos-arm64 macos-x64 linux-x64 linux-arm64 windows-x64; do
+            echo '{}' >"$d/engra-0.2.0-$p.cdx.json"; echo '{}' >"$d/engra-0.2.0-$p.spdx.json"
+            echo notices >"$d/THIRD_PARTY_NOTICES-$p.txt"
+          done
+          for f in LICENSE.txt TERMS.md SHA256SUMS signing-status.json; do echo ok >"$d/$f"; done
+          bash scripts/check-release-assets.sh 0.2.0 "$d"/*
+          touch "$d/app.py"
+          if bash scripts/check-release-assets.sh 0.2.0 "$d"/*; then echo "::error::source file accepted"; exit 1; fi
+          rm "$d/app.py"
+          echo "-----BEGIN PRIVATE KEY-----" >>"$d/TERMS.md"
+          if bash scripts/check-release-assets.sh 0.2.0 "$d"/*; then echo "::error::secret accepted"; exit 1; fi
+          echo "allowlist self-test OK"

@@ -57,6 +57,9 @@ jobs:
       id-token: write # provenance signing
       attestations: write
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Validate inputs
         id: inputs
         env:
@@ -140,11 +143,18 @@ jobs:
           jq -e --arg v "$VERSION" --arg t "$TAG" --arg c "$COMMIT" \
             '.version == $v and .tag == $t and .source_commit == $c and .release == true' \
             build-info.json >/dev/null || { echo "::error::build-info.json does not match $TAG"; exit 1; }
-          for p in $PLATFORMS; do
-            asset="engra-$VERSION-$p"; [[ "$p" == windows-* ]] && asset="$asset.zip"
-            for f in "$asset" "engra-$VERSION-$p.cdx.json" "engra-$VERSION-$p.spdx.json"; do
-              grep -q "  $f\$" SHA256SUMS || { echo "::error::$f missing from SHA256SUMS"; exit 1; }
-            done
+          # The published set is exactly the distribution allowlist, and every
+          # one of those files is covered by SHA256SUMS.
+          mapfile -t assets < <(ls engra-*.tar.gz engra-*.zip engra-*.cdx.json engra-*.spdx.json \
+            THIRD_PARTY_NOTICES-*.txt LICENSE.txt TERMS.md SHA256SUMS signing-status.json)
+          bash ../scripts/check-release-assets.sh "$VERSION" "${assets[@]}"
+          for f in "${assets[@]}"; do
+            [[ "$f" == SHA256SUMS ]] && continue
+            grep -q "  $f\$" SHA256SUMS || { echo "::error::$f missing from SHA256SUMS"; exit 1; }
+          done
+          # This repository's LICENSE.txt and TERMS.md must be the shipped ones.
+          for f in LICENSE.txt TERMS.md; do
+            cmp -s "$f" "../$f" || { echo "::error::$f in the bundle differs from this repository's $f; update the repository copy first"; exit 1; }
           done
           for p in macos-arm64 macos-x64; do
             jq -e --arg p "$p" '.platforms[$p].signed == true and .platforms[$p].notarized == true' \
@@ -152,7 +162,7 @@ jobs:
           done
           # Corporate-identity rule: the source owner never appears in public assets.
           owner="${SRC%%/*}"
-          if grep -rqiF -- "$owner" --include='*.json' --include='*.md' --include='*.rb' --include=SHA256SUMS .; then
+          if grep -rqiF -- "$owner" --include='*.json' --include='*.md' --include='*.rb' --include='*.txt' --include=SHA256SUMS .; then
             echo "::error::a release text file names the source repository owner"; exit 1
           fi
           jq -r '.platforms | to_entries[] | "\(.key): signed=\(.value.signed) notarized=\(.value.notarized)"' signing-status.json
@@ -171,7 +181,13 @@ jobs:
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: |
-            bundle/engra-*
+            bundle/engra-*.tar.gz
+            bundle/engra-*.zip
+            bundle/engra-*.cdx.json
+            bundle/engra-*.spdx.json
+            bundle/THIRD_PARTY_NOTICES-*.txt
+            bundle/LICENSE.txt
+            bundle/TERMS.md
             bundle/SHA256SUMS
             bundle/signing-status.json
 
@@ -182,20 +198,27 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          assets=(bundle/engra-* bundle/SHA256SUMS bundle/signing-status.json)
+          assets=(bundle/engra-*.tar.gz bundle/engra-*.zip bundle/engra-*.cdx.json bundle/engra-*.spdx.json
+            bundle/THIRD_PARTY_NOTICES-*.txt bundle/LICENSE.txt bundle/TERMS.md
+            bundle/SHA256SUMS bundle/signing-status.json)
+          bash scripts/check-release-assets.sh "${TAG#v}" "${assets[@]}"
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target main \
             --title "Engra CLI $TAG" --notes-file bundle/RELEASE_NOTES.md --latest \
             "${assets[@]}"
 
       - name: Published URLs serve the expected hashes
         env:
+          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.inputs.outputs.version }}
           TAG: ${{ steps.inputs.outputs.tag }}
         run: |
           set -euo pipefail
           base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          # Exactly the allowlisted assets were published, nothing else.
+          mapfile -t published < <(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
+          bash scripts/check-release-assets.sh "$VERSION" "${published[@]}"
           for p in $BREW_PLATFORMS; do
-            name="engra-$VERSION-$p"
+            name="engra-$VERSION-$p.tar.gz"
             want="$(awk -v n="$name" '$2 == n { print $1 }' bundle/SHA256SUMS)"
             grep -q "url \"$base/$name\"" bundle/engra.rb
             grep -q "sha256 \"$want\"" bundle/engra.rb
