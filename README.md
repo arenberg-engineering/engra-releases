@@ -34,17 +34,22 @@ formula, as Homebrew 6 requires for third-party taps. Update with
 ### Linux without Homebrew
 
 ```bash
-VERSION=0.2.0
+VERSION=0.2.1
 ARCH=x64                     # or arm64
 BASE=https://github.com/arenberg-engineering/engra-releases/releases/download/v$VERSION
 curl -fLO "$BASE/engra-$VERSION-linux-$ARCH.tar.gz"
 curl -fLO "$BASE/SHA256SUMS"
 sha256sum -c SHA256SUMS --ignore-missing
 tar -xzf "engra-$VERSION-linux-$ARCH.tar.gz"
-install -m 755 "engra-$VERSION-linux-$ARCH/engra" ~/.local/bin/engra
+mkdir -p ~/.local/lib ~/.local/bin
+rm -rf ~/.local/lib/engra
+mv "engra-$VERSION-linux-$ARCH" ~/.local/lib/engra
+ln -sf ~/.local/lib/engra/engra ~/.local/bin/engra
 ```
 
-The Linux builds need glibc 2.35 or newer.
+Keep the extracted directory (including `_internal/`) intact in
+`~/.local/lib/engra` and ensure `~/.local/bin` is on your `PATH`. The Linux
+builds need glibc 2.35 or newer.
 
 ### Windows
 
@@ -74,5 +79,6 @@ spctl --assess --type install -vvv engra-<version>-macos-arm64/engra   # Notariz
 engra logout                 # revokes the session and removes saved tokens
 brew uninstall engra
 brew untap arenberg-engineering/tap
+rm -rf ~/.local/lib/engra ~/.local/bin/engra   # if installed manually on Linux
 rm -rf ~/.config/engra ~/.engra   # optional: settings and doctor records
 ```
