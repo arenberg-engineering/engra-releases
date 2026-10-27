@@ -18,12 +18,15 @@ Rules:
   * names are matched with ``re.fullmatch`` against an ASCII-only allowlist,
     so names with newlines, control characters, unicode lookalikes, leading
     dashes, path separators or extra suffixes are rejected;
-  * archives must hold exactly ``engra-V-<platform>/{engra|engra.exe,
-    LICENSE.txt, TERMS.md, THIRD_PARTY_NOTICES.txt}``: no other members, links,
-    absolute paths or ``..``; so ``.py`` source, ``.env``, keys and ``.pem``
-    files cannot hide inside;
-  * every file and archive member is scanned for credential patterns and
-    internal endpoints.
+  * archives must hold the exact top-level files ``engra-V-<platform>/{engra|engra.exe,
+    LICENSE.txt, TERMS.md, THIRD_PARTY_NOTICES.txt}``, plus optional PyInstaller
+    ``--onedir`` runtime files strictly under ``engra-V-<platform>/_internal/...``
+    with ASCII-only path segments (no dotfiles, ``..``, absolute paths, hardlinks,
+    or ``.py``/key/script suffixes; relative symlinks in ``.tar.gz`` must stay
+    confined inside ``_internal/``, and nested ``.zip`` members such as
+    ``base_library.zip`` are unpacked in memory and checked);
+  * every file, archive member, and nested ``.zip`` member is scanned for
+    credential patterns and internal endpoints.
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import posixpath
 import re
 import subprocess
 import sys
@@ -44,6 +48,37 @@ TAR_PLATFORMS = PLATFORMS[:4]
 LEGAL = ("LICENSE.txt", "TERMS.md")
 SINGLES = ("LICENSE.txt", "TERMS.md", "SHA256SUMS", "signing-status.json")
 VERSION_RE = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", re.ASCII)
+# ASCII [A-Za-z0-9._-] segments, never starting with '.' or '-' (rejects '.', '..', dotfiles, leading '-').
+_INTERNAL_SEG_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*", re.ASCII)
+_FORBIDDEN_INTERNAL_SUFFIXES = (
+    ".py",
+    ".pyc",
+    ".pyo",
+    ".key",
+    ".p12",
+    ".pfx",
+    ".jks",
+    ".kdbx",
+    ".sh",
+    ".ps1",
+    ".bat",
+    ".cmd",
+)
+_FORBIDDEN_NESTED_ZIP_SUFFIXES = (
+    ".py",
+    ".key",
+    ".p12",
+    ".pfx",
+    ".jks",
+    ".kdbx",
+    ".env",
+    ".sh",
+    ".ps1",
+    ".bat",
+    ".cmd",
+    ".zip",
+)
+_MAX_NESTED_ZIP_BYTES = 64 * 1024 * 1024
 
 # Files the repository itself may track (exact paths).
 REPO_ALLOWED = frozenset(
@@ -106,49 +141,205 @@ def scan_bytes(label: str, data: bytes) -> None:
             raise Reject(f"{label}: contains a {what}")
 
 
-def _check_member_name(archive: str, name: str, root: str, exe: str) -> None:
-    allowed = {
-        root + "/",
-        root,
-        *(f"{root}/{n}" for n in (exe, *LEGAL, "THIRD_PARTY_NOTICES.txt")),
-    }
-    if name not in allowed:
+def _valid_internal_rel(rel: str) -> bool:
+    if not rel or not rel.isascii():
+        return False
+    return all(_INTERNAL_SEG_RE.fullmatch(seg) is not None for seg in rel.split("/"))
+
+
+def _check_member_name(
+    archive: str, name: str, root: str, exe: str, *, is_dir: bool = False
+) -> bool:
+    if not name or not name.isascii():
         raise Reject(f"{archive}: unexpected member {name!r}")
+    internal_prefix = f"{root}/_internal/"
+    if is_dir:
+        trimmed = name.removesuffix("/")
+        if trimmed in (root, f"{root}/_internal"):
+            return False
+        if trimmed.startswith(internal_prefix) and _valid_internal_rel(
+            trimmed[len(internal_prefix) :]
+        ):
+            return False
+        raise Reject(f"{archive}: unexpected directory {name!r}")
+
+    top_allowed = {f"{root}/{n}" for n in (exe, *LEGAL, "THIRD_PARTY_NOTICES.txt")}
+    if name in top_allowed:
+        return True
+    if name.startswith(internal_prefix):
+        rel = name[len(internal_prefix) :]
+        if not _valid_internal_rel(rel):
+            raise Reject(f"{archive}: unexpected member {name!r}")
+        if rel.lower().endswith(_FORBIDDEN_INTERNAL_SUFFIXES):
+            raise Reject(f"{archive}: forbidden runtime member {name!r}")
+        return False
+    raise Reject(f"{archive}: unexpected member {name!r}")
+
+
+def _check_tar_symlink(archive: str, member: tarfile.TarInfo, root: str) -> None:
+    linkname = member.linkname
+    if (
+        not linkname
+        or not linkname.isascii()
+        or linkname.startswith("/")
+        or any(ch in linkname for ch in ("\x00", "\n", "\r", "\\"))
+    ):
+        raise Reject(
+            f"{archive}: invalid symlink target {linkname!r} for {member.name!r}"
+        )
+    segs = linkname.split("/")
+    if not all(
+        seg == ".." or _INTERNAL_SEG_RE.fullmatch(seg) is not None for seg in segs
+    ):
+        raise Reject(
+            f"{archive}: invalid symlink target {linkname!r} for {member.name!r}"
+        )
+    internal_root = f"{root}/_internal"
+    internal_prefix = f"{internal_root}/"
+    cur = posixpath.dirname(member.name)
+    for seg in segs:
+        cur = posixpath.normpath(posixpath.join(cur, seg))
+        if cur != internal_root and not cur.startswith(internal_prefix):
+            raise Reject(
+                f"{archive}: symlink {member.name!r} -> {linkname!r} escapes _internal/"
+            )
+    resolved = posixpath.normpath(
+        posixpath.join(posixpath.dirname(member.name), linkname)
+    )
+    if not resolved.startswith(internal_prefix):
+        raise Reject(
+            f"{archive}: symlink {member.name!r} -> {linkname!r} escapes _internal/"
+        )
+    if resolved.lower().endswith(_FORBIDDEN_INTERNAL_SUFFIXES):
+        raise Reject(
+            f"{archive}: symlink {member.name!r} -> {linkname!r} targets forbidden suffix"
+        )
+    scan_bytes(f"{archive}:{member.name}", linkname.encode("ascii"))
+
+
+def _check_nested_zip(label: str, data: bytes) -> None:
+    try:
+        zf_ctx = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile as exc:
+        raise Reject(f"{label}: invalid nested zip: {exc}") from exc
+    total_size = 0
+    seen_inner: set[str] = set()
+    with zf_ctx as zf:
+        for info in zf.infolist():
+            name = info.filename
+            if not name or not name.isascii():
+                raise Reject(f"{label}: invalid nested member {name!r}")
+            if info.flag_bits & 0x1:
+                raise Reject(f"{label}: encrypted nested member {name!r}")
+            mode = (info.external_attr >> 16) & 0o170000
+            if info.is_dir():
+                if mode not in (0, 0o040000):
+                    raise Reject(f"{label}: {name!r} is not a regular directory")
+                rel = name[:-1]
+                if not _valid_internal_rel(rel) or rel in seen_inner:
+                    raise Reject(f"{label}: unexpected nested directory {name!r}")
+                seen_inner.add(rel)
+                continue
+            if mode not in (0, 0o100000):
+                raise Reject(f"{label}: {name!r} is not a regular file")
+            if not _valid_internal_rel(name) or name in seen_inner:
+                raise Reject(f"{label}: unexpected nested member {name!r}")
+            if name.lower().endswith(_FORBIDDEN_NESTED_ZIP_SUFFIXES):
+                raise Reject(f"{label}: forbidden nested member {name!r}")
+            if (
+                info.file_size < 0
+                or total_size + info.file_size > _MAX_NESTED_ZIP_BYTES
+            ):
+                raise Reject(
+                    f"{label}: nested zip exceeds {_MAX_NESTED_ZIP_BYTES} bytes"
+                )
+            seen_inner.add(name)
+            remaining = _MAX_NESTED_ZIP_BYTES - total_size
+            with zf.open(info, "r") as fp:
+                raw = fp.read(remaining + 1)
+            if len(raw) > remaining:
+                raise Reject(
+                    f"{label}: nested zip exceeds {_MAX_NESTED_ZIP_BYTES} bytes"
+                )
+            total_size += max(info.file_size, len(raw))
+            scan_bytes(f"{label}:{name}", raw)
 
 
 def check_archive(path: Path, version: str, platform: str) -> None:
     root = f"engra-{version}-{platform}"
     exe = "engra.exe" if platform.startswith("windows") else "engra"
     want = {f"{root}/{n}" for n in (exe, *LEGAL, "THIRD_PARTY_NOTICES.txt")}
-    seen: set[str] = set()
+    seen_top: set[str] = set()
+    seen_paths: set[str] = set()
     if path.name.endswith(".zip"):
         with zipfile.ZipFile(path) as zf:
             for info in zf.infolist():
-                _check_member_name(path.name, info.filename, root, exe)
-                if info.is_dir():
-                    continue
+                if info.flag_bits & 0x1:
+                    raise Reject(f"{path.name}: encrypted member {info.filename!r}")
+                is_dir = info.is_dir()
+                is_top = _check_member_name(
+                    path.name, info.filename, root, exe, is_dir=is_dir
+                )
+                norm = info.filename[:-1] if is_dir else info.filename
+                if norm in seen_paths:
+                    raise Reject(f"{path.name}: duplicate member {info.filename!r}")
+                seen_paths.add(norm)
                 mode = (info.external_attr >> 16) & 0o170000
+                if is_dir:
+                    if mode not in (0, 0o040000):
+                        raise Reject(
+                            f"{path.name}: {info.filename!r} is not a regular directory"
+                        )
+                    continue
                 if mode not in (0, 0o100000):
                     raise Reject(
                         f"{path.name}: {info.filename!r} is not a regular file"
                     )
-                seen.add(info.filename)
-                scan_bytes(f"{path.name}:{info.filename}", zf.read(info))
+                if is_top:
+                    seen_top.add(info.filename)
+                data = zf.read(info)
+                label = f"{path.name}:{info.filename}"
+                scan_bytes(label, data)
+                if not is_top and info.filename.lower().endswith(".zip"):
+                    _check_nested_zip(label, data)
     else:
         with tarfile.open(path, mode="r:gz") as tf:
             for member in tf.getmembers():
-                _check_member_name(path.name, member.name, root, exe)
-                if member.isdir():
+                is_dir = member.isdir()
+                is_top = _check_member_name(
+                    path.name, member.name, root, exe, is_dir=is_dir
+                )
+                norm = (
+                    member.name[:-1]
+                    if is_dir and member.name.endswith("/")
+                    else member.name
+                )
+                if norm in seen_paths:
+                    raise Reject(f"{path.name}: duplicate member {member.name!r}")
+                seen_paths.add(norm)
+                if is_dir:
                     continue
-                if not member.isfile():
+                if member.issym():
+                    if is_top:
+                        raise Reject(
+                            f"{path.name}: {member.name!r} is not a regular file"
+                        )
+                    _check_tar_symlink(path.name, member, root)
+                    continue
+                if member.islnk() or not member.isfile():
                     raise Reject(f"{path.name}: {member.name!r} is not a regular file")
-                seen.add(member.name)
+                if is_top:
+                    seen_top.add(member.name)
                 fh = tf.extractfile(member)
                 if fh is None:
                     raise Reject(f"{path.name}: cannot read {member.name!r}")
-                scan_bytes(f"{path.name}:{member.name}", fh.read())
-    if seen != want:
-        raise Reject(f"{path.name}: members {sorted(seen)} != {sorted(want)}")
+                data = fh.read()
+                label = f"{path.name}:{member.name}"
+                scan_bytes(label, data)
+                if not is_top and member.name.lower().endswith(".zip"):
+                    _check_nested_zip(label, data)
+    if not want.issubset(seen_top) or seen_top != want:
+        raise Reject(f"{path.name}: members {sorted(seen_top)} != {sorted(want)}")
 
 
 def check_assets(version: str, directory: Path) -> list[str]:
@@ -199,31 +390,82 @@ def check_repo(root: Path) -> None:
 # ── self-test ────────────────────────────────────────────────────────────────
 
 
-def _write_valid_bundle(d: Path, version: str) -> None:
+def _build_base_library_zip(
+    extra: dict[str, bytes] | None = None, *, deflated: bool = False
+) -> bytes:
+    buf = io.BytesIO()
+    comp = zipfile.ZIP_DEFLATED if deflated else zipfile.ZIP_STORED
+    with zipfile.ZipFile(buf, "w", compression=comp) as zf:
+        zf.writestr("encodings/__init__.pyc", b"\xa7\r\r\nbytecode")
+        zf.writestr("_collections_abc.pyc", b"\xa7\r\r\nbytecode")
+        for k, v in (extra or {}).items():
+            zf.writestr(k, v)
+    return buf.getvalue()
+
+
+def _write_valid_bundle(d: Path, version: str, *, onedir: bool = False) -> None:
     for name in expected_assets(version):
         if name.endswith(".json"):
             (d / name).write_text("{}", encoding="utf-8")
         elif not name.endswith((".tar.gz", ".zip")):
             (d / name).write_text("ok\n", encoding="utf-8")
+    base_lib = _build_base_library_zip()
     for p in PLATFORMS:
         root = f"engra-{version}-{p}"
         exe = "engra.exe" if p.startswith("windows") else "engra"
-        files = {
+        files: dict[str, bytes] = {
             exe: b"\x7fELF binary",
             "LICENSE.txt": b"l",
             "TERMS.md": b"t",
             "THIRD_PARTY_NOTICES.txt": b"n",
         }
+        if onedir:
+            files["_internal/certifi/cacert.pem"] = (
+                b"-----BEGIN CERTIFICATE-----\nMIIB\n"
+            )
+            files["_internal/base_library.zip"] = base_lib
+            if p.startswith("windows"):
+                files["_internal/python311.dll"] = b"MZdll"
+                files["_internal/_asyncio.pyd"] = b"MZpyd"
+            elif p.startswith("macos"):
+                files["_internal/libpython3.11.dylib"] = b"\xcf\xfa\xed\xfedylib"
+                files["_internal/Python.framework/Versions/3.11/Python"] = b"macho"
+                files["_internal/_cffi_backend.cpython-311-darwin.so"] = b"macho"
+            else:
+                files["_internal/libpython3.11.so.1.0"] = b"\x7fELFso"
+                files["_internal/_cffi_backend.cpython-311-linux.so"] = b"\x7fELFso"
         if p.startswith("windows"):
             with zipfile.ZipFile(d / f"{root}.zip", "w") as zf:
                 for n, data in files.items():
                     zf.writestr(f"{root}/{n}", data)
         else:
             with tarfile.open(d / f"{root}.tar.gz", "w:gz") as tf:
+                if onedir:
+                    for dir_rel in ("", "/_internal", "/_internal/certifi"):
+                        dinfo = tarfile.TarInfo(f"{root}{dir_rel}")
+                        dinfo.type = tarfile.DIRTYPE
+                        dinfo.mode = 0o755
+                        tf.addfile(dinfo)
                 for n, data in files.items():
                     info = tarfile.TarInfo(f"{root}/{n}")
                     info.size = len(data)
                     tf.addfile(info, io.BytesIO(data))
+                if onedir and p.startswith("macos"):
+                    for link_rel, target in (
+                        ("_internal/Python", "Python.framework/Versions/3.11/Python"),
+                        (
+                            "_internal/Python.framework/Versions/Current",
+                            "3.11",
+                        ),
+                        (
+                            "_internal/Python.framework/Python",
+                            "Versions/Current/Python",
+                        ),
+                    ):
+                        sinfo = tarfile.TarInfo(f"{root}/{link_rel}")
+                        sinfo.type = tarfile.SYMTYPE
+                        sinfo.linkname = target
+                        tf.addfile(sinfo)
 
 
 def selftest() -> None:
@@ -249,7 +491,7 @@ def selftest() -> None:
         d = Path(tmp)
         _write_valid_bundle(d, version)
         check_assets(version, d)
-        print("[selftest] valid bundle accepted")
+        print("[selftest] valid --onefile bundle accepted")
 
         # 1. A filename with an embedded newline (and other parser tricks).
         for name in (
@@ -351,7 +593,10 @@ def selftest() -> None:
             "loopback": "http://127.0.0.1" + ":8099/v1",
         }
         for label, text in samples.items():
-            must_fail(f"pattern parity: {label}", lambda t=text: scan_bytes("sample", t.encode()))
+            must_fail(
+                f"pattern parity: {label}",
+                lambda t=text: scan_bytes("sample", t.encode()),
+            )
 
         # 9. The real CI entrypoints, run as CI runs them, exit non-zero on a
         #    deliberately bad tree and a deliberately bad bundle.
@@ -362,9 +607,13 @@ def selftest() -> None:
         (bad_repo / "README.md").write_text("ok\n")
         (bad_repo / "server.py").write_text("import os\n")
         subprocess.run(["git", "-C", str(bad_repo), "add", "--", "."], check=True)
-        rc = subprocess.run([sys.executable, script, "repo"], cwd=bad_repo, check=False).returncode
+        rc = subprocess.run(
+            [sys.executable, script, "repo"], cwd=bad_repo, check=False
+        ).returncode
         if rc == 0:
-            raise SystemExit("[selftest] FAIL: `repo` entrypoint accepted a tree with server.py")
+            raise SystemExit(
+                "[selftest] FAIL: `repo` entrypoint accepted a tree with server.py"
+            )
         print(f"[selftest] `repo` entrypoint exits {rc} on a bad tree")
         (d / "SHA256SUMS").unlink()
         rc = subprocess.run(
@@ -372,16 +621,176 @@ def selftest() -> None:
             check=False,
         ).returncode
         if rc == 0:
-            raise SystemExit("[selftest] FAIL: `assets` entrypoint accepted a bundle missing SHA256SUMS")
+            raise SystemExit(
+                "[selftest] FAIL: `assets` entrypoint accepted a bundle missing SHA256SUMS"
+            )
         print(f"[selftest] `assets` entrypoint exits {rc} on a bad bundle")
         (d / "broken.json").write_text("{not json")
         rc = subprocess.run(
-            [sys.executable, script, "release", "--version", version, "--json", str(d / "broken.json")],
+            [
+                sys.executable,
+                script,
+                "release",
+                "--version",
+                version,
+                "--json",
+                str(d / "broken.json"),
+            ],
             check=False,
         ).returncode
         if rc == 0:
-            raise SystemExit("[selftest] FAIL: `release` entrypoint accepted unparsable JSON")
+            raise SystemExit(
+                "[selftest] FAIL: `release` entrypoint accepted unparsable JSON"
+            )
         print(f"[selftest] `release` entrypoint exits {rc} on unparsable JSON")
+
+        # 10. PyInstaller --onedir bundle acceptance and bypass rejections.
+        onedir_v = "0.2.1"
+        od = d / "onedir"
+        od.mkdir()
+        _write_valid_bundle(od, onedir_v, onedir=True)
+        check_assets(onedir_v, od)
+        print("[selftest] valid --onedir bundle accepted")
+
+        win_zip = od / f"engra-{onedir_v}-windows-x64.zip"
+        good_win_zip = win_zip.read_bytes()
+        mac_tar = od / f"engra-{onedir_v}-macos-arm64.tar.gz"
+        good_mac_tar = mac_tar.read_bytes()
+        win_root = f"engra-{onedir_v}-windows-x64"
+        mac_root = f"engra-{onedir_v}-macos-arm64"
+
+        def _write_mac_tar_extra(
+            extra_files: dict[str, bytes] | None = None,
+            extra_links: list[tuple[str, str, bytes]] | None = None,
+        ) -> None:
+            with tarfile.open(mac_tar, "w:gz") as tf:
+                for n, data in {
+                    "engra": b"macho",
+                    "LICENSE.txt": b"l",
+                    "TERMS.md": b"t",
+                    "THIRD_PARTY_NOTICES.txt": b"n",
+                    "_internal/libpython3.11.dylib": b"dylib",
+                    "_internal/base_library.zip": _build_base_library_zip(),
+                    **(extra_files or {}),
+                }.items():
+                    info = tarfile.TarInfo(f"{mac_root}/{n}")
+                    info.size = len(data)
+                    tf.addfile(info, io.BytesIO(data))
+                for rel_name, target, ltype in extra_links or []:
+                    sinfo = tarfile.TarInfo(f"{mac_root}/{rel_name}")
+                    sinfo.type = ltype
+                    sinfo.linkname = target
+                    tf.addfile(sinfo)
+
+        # (b) .py source file inside _internal/ -> rejected.
+        with zipfile.ZipFile(win_zip, "a") as zf:
+            zf.writestr(f"{win_root}/_internal/leak.py", b"print('leak')\n")
+        must_fail(".py inside _internal/", lambda: check_assets(onedir_v, od))
+        win_zip.write_bytes(good_win_zip)
+
+        # (c) .env dotfile inside _internal/ -> rejected.
+        _write_mac_tar_extra(extra_files={"_internal/.env": b"KEY=1\n"})
+        must_fail(".env dotfile inside _internal/", lambda: check_assets(onedir_v, od))
+        mac_tar.write_bytes(good_mac_tar)
+
+        # (d) Secret inside _internal/ regular file -> rejected.
+        _write_mac_tar_extra(
+            extra_files={"_internal/config.json": ("x " + fake_stripe).encode()}
+        )
+        must_fail("secret inside _internal/ file", lambda: check_assets(onedir_v, od))
+        mac_tar.write_bytes(good_mac_tar)
+
+        # (e) Secret or .py or traversal hidden inside nested _internal/base_library.zip -> rejected.
+        _write_mac_tar_extra(
+            extra_files={
+                "_internal/base_library.zip": _build_base_library_zip(
+                    {"pkg/secret.pyc": (("tok=" + fake_stripe + "\n") * 8).encode()},
+                    deflated=True,
+                )
+            }
+        )
+        must_fail(
+            "secret inside nested base_library.zip", lambda: check_assets(onedir_v, od)
+        )
+        _write_mac_tar_extra(
+            extra_files={
+                "_internal/base_library.zip": _build_base_library_zip(
+                    {"pkg/mod.py": b"x = 1\n"}
+                )
+            }
+        )
+        must_fail(
+            ".py inside nested base_library.zip", lambda: check_assets(onedir_v, od)
+        )
+        _write_mac_tar_extra(
+            extra_files={
+                "_internal/base_library.zip": _build_base_library_zip(
+                    {"../escape.pyc": b"\xa7\r\r\n"}
+                )
+            }
+        )
+        must_fail(
+            ".. traversal inside nested base_library.zip",
+            lambda: check_assets(onedir_v, od),
+        )
+        mac_tar.write_bytes(good_mac_tar)
+
+        # (f) Symlink at top level ({root}/evil and {root}/engra) -> rejected.
+        _write_mac_tar_extra(
+            extra_links=[("evil", "_internal/libpython3.11.dylib", tarfile.SYMTYPE)]
+        )
+        must_fail("symlink at top level (evil)", lambda: check_assets(onedir_v, od))
+        with tarfile.open(mac_tar, "w:gz") as tf:
+            for n, data in {
+                "LICENSE.txt": b"l",
+                "TERMS.md": b"t",
+                "THIRD_PARTY_NOTICES.txt": b"n",
+                "_internal/engra_bin": b"macho",
+            }.items():
+                info = tarfile.TarInfo(f"{mac_root}/{n}")
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+            sinfo = tarfile.TarInfo(f"{mac_root}/engra")
+            sinfo.type = tarfile.SYMTYPE
+            sinfo.linkname = "_internal/engra_bin"
+            tf.addfile(sinfo)
+        must_fail("top-level exe as symlink", lambda: check_assets(onedir_v, od))
+        mac_tar.write_bytes(good_mac_tar)
+
+        # (g) Symlink inside _internal/ escaping _internal/ (relative, absolute, or out-and-back) -> rejected.
+        for bad_target in (
+            "../../etc/passwd",
+            "/etc/passwd",
+            "../engra",
+            f"../../{mac_root}/_internal/libpython3.11.dylib",
+        ):
+            _write_mac_tar_extra(
+                extra_links=[("_internal/escape", bad_target, tarfile.SYMTYPE)]
+            )
+            must_fail(
+                f"escaping _internal/ symlink ({bad_target})",
+                lambda: check_assets(onedir_v, od),
+            )
+        _write_mac_tar_extra(
+            extra_links=[
+                (
+                    "_internal/hardlink",
+                    f"{mac_root}/_internal/libpython3.11.dylib",
+                    tarfile.LNKTYPE,
+                )
+            ]
+        )
+        must_fail("hardlink inside _internal/", lambda: check_assets(onedir_v, od))
+        mac_tar.write_bytes(good_mac_tar)
+
+        # (h) Symlink entry inside Windows .zip -> rejected.
+        with zipfile.ZipFile(win_zip, "a") as zf:
+            zinfo = zipfile.ZipInfo(f"{win_root}/_internal/sym")
+            zinfo.create_system = 3
+            zinfo.external_attr = 0o120777 << 16
+            zf.writestr(zinfo, "python311.dll")
+        must_fail("symlink inside Windows .zip", lambda: check_assets(onedir_v, od))
+        win_zip.write_bytes(good_win_zip)
     print("[selftest] OK")
 
 
