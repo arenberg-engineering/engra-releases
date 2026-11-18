@@ -46,8 +46,16 @@ from pathlib import Path
 PLATFORMS = ("macos-arm64", "macos-x64", "linux-x64", "linux-arm64", "windows-x64")
 TAR_PLATFORMS = PLATFORMS[:4]
 LEGAL = ("LICENSE.txt", "TERMS.md")
-SINGLES = ("LICENSE.txt", "TERMS.md", "SHA256SUMS", "signing-status.json")
+SINGLES = (
+    "LICENSE.txt",
+    "TERMS.md",
+    "SHA256SUMS",
+    "signing-status.json",
+    "build-info.json",
+)
 VERSION_RE = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", re.ASCII)
+_COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}", re.ASCII)
+_HEX64_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
 # ASCII [A-Za-z0-9._-] segments, never starting with '.' or '-' (rejects '.', '..', dotfiles, leading '-').
 _INTERNAL_SEG_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*", re.ASCII)
 _FORBIDDEN_INTERNAL_SUFFIXES = (
@@ -342,6 +350,35 @@ def check_archive(path: Path, version: str, platform: str) -> None:
         raise Reject(f"{path.name}: members {sorted(seen_top)} != {sorted(want)}")
 
 
+def check_build_info(data: bytes, version: str, expected_names: list[str]) -> None:
+    try:
+        info = json.loads(data)
+    except Exception as exc:
+        raise Reject(f"build-info.json: invalid JSON: {exc}") from exc
+    if not isinstance(info, dict):
+        raise Reject("build-info.json: root must be a JSON object")
+    if info.get("version") != version:
+        raise Reject(f"build-info.json: version {info.get('version')!r} != {version!r}")
+    expected_tag = f"v{version}"
+    if info.get("tag") != expected_tag:
+        raise Reject(f"build-info.json: tag {info.get('tag')!r} != {expected_tag!r}")
+    commit = info.get("source_commit")
+    if not isinstance(commit, str) or not _COMMIT_SHA_RE.fullmatch(commit):
+        raise Reject(f"build-info.json: invalid 40-hex source_commit {commit!r}")
+    logo_sha = info.get("logo_png_64_sha256")
+    if not isinstance(logo_sha, str) or not _HEX64_RE.fullmatch(logo_sha):
+        raise Reject(f"build-info.json: invalid 64-hex logo_png_64_sha256 {logo_sha!r}")
+    if not isinstance(info.get("release"), bool):
+        raise Reject("build-info.json: release field must be a boolean")
+    assets = info.get("assets")
+    if (
+        not isinstance(assets, list)
+        or sorted(assets) != expected_names
+        or assets != expected_names
+    ):
+        raise Reject(f"build-info.json: assets {assets!r} != {expected_names!r}")
+
+
 def check_assets(version: str, directory: Path) -> list[str]:
     names = expected_assets(version)
     for name in names:
@@ -355,6 +392,8 @@ def check_assets(version: str, directory: Path) -> list[str]:
             data = path.read_bytes()
             if name.endswith(".json"):
                 json.loads(data)  # must parse; a parse error fails closed
+            if name == "build-info.json":
+                check_build_info(data, version, names)
             scan_bytes(name, data)
     return names
 
@@ -404,8 +443,25 @@ def _build_base_library_zip(
 
 
 def _write_valid_bundle(d: Path, version: str, *, onedir: bool = False) -> None:
-    for name in expected_assets(version):
-        if name.endswith(".json"):
+    expected = expected_assets(version)
+    for name in expected:
+        if name == "build-info.json":
+            (d / name).write_text(
+                json.dumps(
+                    {
+                        "version": version,
+                        "tag": f"v{version}",
+                        "source_commit": "0123456789abcdef0123456789abcdef01234567",
+                        "logo_png_64_sha256": "77a1e6a3b30ff30a26ad4484c9375812e57b7720e4e7bac39b95d7aa10229168",
+                        "release": True,
+                        "assets": expected,
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        elif name.endswith(".json"):
             (d / name).write_text("{}", encoding="utf-8")
         elif not name.endswith((".tar.gz", ".zip")):
             (d / name).write_text("ok\n", encoding="utf-8")
@@ -791,6 +847,29 @@ def selftest() -> None:
             zf.writestr(zinfo, "python311.dll")
         must_fail("symlink inside Windows .zip", lambda: check_assets(onedir_v, od))
         win_zip.write_bytes(good_win_zip)
+
+        # 11. build-info.json presence, schema, commit-hash, and asset-set integrity.
+        bi_path = od / "build-info.json"
+        good_bi = bi_path.read_bytes()
+        bi_path.unlink()
+        must_fail("missing build-info.json", lambda: check_assets(onedir_v, od))
+        for bad_label, bad_patch in (
+            ("wrong version", {"version": "9.9.9"}),
+            ("wrong tag", {"tag": "v9.9.9"}),
+            ("non-40-hex source_commit", {"source_commit": "development"}),
+            (
+                "missing asset in build-info.json",
+                {"assets": expected_assets(onedir_v)[:-1]},
+            ),
+        ):
+            patched = json.loads(good_bi)
+            patched.update(bad_patch)
+            bi_path.write_text(json.dumps(patched), encoding="utf-8")
+            must_fail(
+                f"build-info.json ({bad_label})", lambda: check_assets(onedir_v, od)
+            )
+        bi_path.write_bytes(good_bi)
+        check_assets(onedir_v, od)
     print("[selftest] OK")
 
 
