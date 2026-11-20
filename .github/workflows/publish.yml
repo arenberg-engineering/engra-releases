@@ -57,8 +57,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: publish-${{ inputs.tag }}-${{ inputs.dry_run && 'dry-run' || 'live' }}
-  cancel-in-progress: ${{ inputs.dry_run == true }}
+  group: publish-${{ inputs.tag }}-${{ (inputs.dry_run == true || inputs.dry_run == 'true') && 'dry-run' || 'live' }}
+  cancel-in-progress: ${{ inputs.dry_run == true || inputs.dry_run == 'true' }}
 
 env:
   TAP_REPO: arenberg-engineering/homebrew-tap
@@ -289,20 +289,24 @@ jobs:
           [[ -n "${GH_TOKEN:-}" ]] || { echo "::error::tap credentials missing"; exit 1; }
 
           # Verify Formula/engra.rb is readable in the tap repository.
-          gh api "repos/$TAP_REPO/contents/Formula/engra.rb" --jq -e '.type == "file"' >/dev/null || {
+          gh api "repos/$TAP_REPO/contents/Formula/engra.rb" | jq -e '.type == "file"' >/dev/null || {
             echo "::error::Formula/engra.rb is not readable in $TAP_REPO"
             exit 1
           }
 
           # Verify tap write permissions without mutating the repository.
           if [[ "$TAP_MODE" == "app" ]]; then
-            gh api "/installation/repositories" | jq -e --arg r "$TAP_REPO" '
-              .repositories | map(.full_name) == [$r] and .[0].permissions.contents == "write" and .[0].permissions.pull_requests == "write"' >/dev/null || {
-              echo "::error::GitHub App token lacks contents:write or pull_requests:write on $TAP_REPO"
+            gh api "/installation/repositories?per_page=100" | jq -e --arg r "$TAP_REPO" '
+              .total_count == 1 and (.repositories | map(.full_name) == [$r]) and .repositories[0].permissions.push == true' >/dev/null || {
+              echo "::error::GitHub App token is not scoped exclusively to $TAP_REPO with push access"
+              exit 1
+            }
+            gh api "repos/$TAP_REPO/pulls?state=open&per_page=1" | jq -e 'type == "array"' >/dev/null || {
+              echo "::error::GitHub App token cannot query pull requests on $TAP_REPO"
               exit 1
             }
           else
-            gh api "repos/$TAP_REPO" --jq -e '.permissions.push == true' >/dev/null || {
+            gh api "repos/$TAP_REPO" | jq -e '.permissions.push == true' >/dev/null || {
               echo "::error::Token lacks push permissions on $TAP_REPO"
               exit 1
             }
