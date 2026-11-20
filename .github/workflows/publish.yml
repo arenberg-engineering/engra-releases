@@ -279,6 +279,7 @@ jobs:
           GH_TOKEN: ${{ steps.tap_app.outputs.token || secrets.HOMEBREW_TAP_TOKEN }}
           TAP_MODE: ${{ steps.auth_cfg.outputs.tap_mode }}
           SRC_MODE: ${{ steps.auth_cfg.outputs.source_mode }}
+          APP_SLUG: ${{ steps.tap_app.outputs.app-slug }}
           VERSION: ${{ steps.inputs.outputs.version }}
           TAG: ${{ steps.inputs.outputs.tag }}
           DRY_RUN: ${{ steps.inputs.outputs.dry_run }}
@@ -294,17 +295,27 @@ jobs:
             exit 1
           }
 
-          # Verify tap write permissions without mutating the repository.
+          # Verify tap scope and permissions without mutating the repository.
+          # For GitHub App installation tokens (ghs_), actions/create-github-app-token
+          # already fails closed (HTTP 422) unless contents:write and pull_requests:write
+          # are granted, whereas GET /installation/repositories always populates the
+          # human OAuth collaborator map (.permissions.push) as false.
           if [[ "$TAP_MODE" == "app" ]]; then
             gh api "/installation/repositories?per_page=100" | jq -e --arg r "$TAP_REPO" '
-              .total_count == 1 and (.repositories | map(.full_name) == [$r]) and .repositories[0].permissions.push == true' >/dev/null || {
-              echo "::error::GitHub App token is not scoped exclusively to $TAP_REPO with push access"
+              .total_count == 1 and (.repositories | map(.full_name) == [$r])' >/dev/null || {
+              echo "::error::GitHub App token is not scoped exclusively to $TAP_REPO"
               exit 1
             }
             gh api "repos/$TAP_REPO/pulls?state=open&per_page=1" | jq -e 'type == "array"' >/dev/null || {
               echo "::error::GitHub App token cannot query pull requests on $TAP_REPO"
               exit 1
             }
+            if [[ -n "${APP_SLUG:-}" ]]; then
+              gh api "users/${APP_SLUG}%5Bbot%5D" | jq -e '.type == "Bot" and (.id | type == "number")' >/dev/null || {
+                echo "::error::GitHub App bot identity ${APP_SLUG}[bot] could not be resolved"
+                exit 1
+              }
+            fi
           else
             gh api "repos/$TAP_REPO" | jq -e '.permissions.push == true' >/dev/null || {
               echo "::error::Token lacks push permissions on $TAP_REPO"
