@@ -7,20 +7,33 @@
 #      that exact tag, whose commit is on the source repository's main branch;
 #   2. downloads that run's `release-bundle` and checks its checksums, asset
 #      set, build info and macOS notarization status;
-#   3. attests provenance for every asset (verifiable by anyone with
+#   3. preflights tap write permissions and verifies OIDC provenance readiness;
+#   4. attests provenance for every asset (verifiable by anyone with
 #      `gh attestation verify <asset> --repo arenberg-engineering/engra-releases`);
-#   4. creates the GitHub Release (never overwrites an existing one);
-#   5. checks the published URLs serve the expected hashes, and opens a pull
-#      request to arenberg-engineering/homebrew-tap with the generated formula.
-#      It never pushes to the tap's main branch.
+#   5. creates the GitHub Release (never overwrites an existing one);
+#   6. checks the published URLs serve the expected hashes and verifiable
+#      provenance, and opens a pull request to arenberg-engineering/homebrew-tap
+#      with the generated formula. It never pushes to the tap's main branch.
 #
 # Environment secrets (release-publish only, referenced by name):
-#   ENGRA_SOURCE_REPO        owner/name of the source repository (kept secret so
-#                            it never appears in this public repository or logs)
-#   ENGRA_SOURCE_READ_TOKEN  fine-grained token: that repository only,
+#   ENGRA_SOURCE_REPO        owner/name of the private source repository (kept
+#                            secret so it never appears in this public repository
+#                            or logs)
+#
+# Recommended Primary (GitHub App):
+#   RELEASE_APP_CLIENT_ID    Client ID of the dedicated corporate GitHub App
+#                            installed on the source repository (Actions read +
+#                            Contents read) and arenberg-engineering/homebrew-tap
+#                            (Contents write + Pull requests write)
+#   RELEASE_APP_PRIVATE_KEY  PEM private key for that GitHub App (ephemeral 1h
+#                            tokens minted & downscoped per step via
+#                            actions/create-github-app-token and revoked post-job)
+#
+# Fallback Compatibility (Fine-Grained Tokens):
+#   ENGRA_SOURCE_READ_TOKEN  single-repo fine-grained token: source repository only,
 #                            Actions read + Contents read
-#   HOMEBREW_TAP_TOKEN       fine-grained token or GitHub App: homebrew-tap only,
-#                            Contents read/write + Pull requests read/write
+#   HOMEBREW_TAP_TOKEN       single-repo fine-grained token: homebrew-tap only,
+#                            Contents write + Pull requests write
 name: publish
 
 on:
@@ -34,13 +47,18 @@ on:
         description: "cli-release run id (optional; default: latest successful run for the tag)"
         required: false
         type: string
+      dry_run:
+        description: "Non-disruptive validation only (verify credentials, source run, bundle, OIDC & tap access; no release, attestation or PR writes)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
 
 concurrency:
-  group: publish-${{ inputs.tag }}
-  cancel-in-progress: false
+  group: publish-${{ inputs.tag }}-${{ (inputs.dry_run == true || inputs.dry_run == 'true') && 'dry-run' || 'live' }}
+  cancel-in-progress: ${{ inputs.dry_run == true || inputs.dry_run == 'true' }}
 
 env:
   TAP_REPO: arenberg-engineering/homebrew-tap
@@ -49,7 +67,7 @@ env:
 
 jobs:
   publish:
-    name: publish ${{ inputs.tag }}
+    name: publish
     runs-on: ubuntu-24.04
     environment: release-publish
     permissions:
@@ -57,39 +75,124 @@ jobs:
       id-token: write # provenance signing
       attestations: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
       - name: Validate inputs
         id: inputs
         env:
           TAG: ${{ inputs.tag }}
           RUN_ID: ${{ inputs.run_id }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
           if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "::error::tag must be vX.Y.Z"; exit 1
           fi
-          if [[ -n "$RUN_ID" && ! "$RUN_ID" =~ ^[0-9]+$ ]]; then
+          if [[ -n "$RUN_ID" && ! "$RUN_ID" =~ ^[0-9]*$ ]]; then
             echo "::error::run_id must be numeric"; exit 1
+          fi
+          if [[ ! "$DRY_RUN" =~ ^(true|false)$ ]]; then
+            echo "::error::dry_run must be boolean (true or false)"; exit 1
           fi
           {
             echo "tag=$TAG"
             echo "version=${TAG#v}"
             echo "run_id=$RUN_ID"
+            echo "dry_run=$DRY_RUN"
           } >>"$GITHUB_OUTPUT"
+
+      - name: Resolve source repository and credential mode
+        id: auth_cfg
+        env:
+          SRC: ${{ secrets.ENGRA_SOURCE_REPO }}
+          APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          SRC_TOKEN: ${{ secrets.ENGRA_SOURCE_READ_TOKEN }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SRC:-}" || ! "$SRC" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::ENGRA_SOURCE_REPO must be set to 'owner/repo' in the release-publish environment"
+            exit 1
+          fi
+          src_owner="${SRC%%/*}"
+          src_repo="${SRC#*/}"
+          echo "::add-mask::$src_owner"
+          echo "::add-mask::$src_repo"
+
+          has_app_id=false
+          has_app_key=false
+          [[ -n "${APP_CLIENT_ID:-}" ]] && has_app_id=true
+          [[ -n "${APP_PRIVATE_KEY:-}" ]] && has_app_key=true
+
+          if [[ "$has_app_id" != "$has_app_key" ]]; then
+            echo "::error::RELEASE_APP_CLIENT_ID and RELEASE_APP_PRIVATE_KEY must both be set or both unset (half-configured)"
+            exit 1
+          fi
+
+          if [[ "$has_app_id" == "true" ]]; then
+            source_mode="app"
+            tap_mode="app"
+          else
+            if [[ -n "${SRC_TOKEN:-}" ]]; then
+              source_mode="token"
+            else
+              echo "::error::No source read credentials configured; provide RELEASE_APP_CLIENT_ID+RELEASE_APP_PRIVATE_KEY or ENGRA_SOURCE_READ_TOKEN in release-publish environment"
+              exit 1
+            fi
+            if [[ -n "${TAP_TOKEN:-}" ]]; then
+              tap_mode="token"
+            else
+              echo "::error::No Homebrew tap credentials configured; provide RELEASE_APP_CLIENT_ID+RELEASE_APP_PRIVATE_KEY or HOMEBREW_TAP_TOKEN in release-publish environment"
+              exit 1
+            fi
+          fi
+
+          {
+            echo "src_owner=$src_owner"
+            echo "src_repo=$src_repo"
+            echo "source_mode=$source_mode"
+            echo "tap_mode=$tap_mode"
+          } >>"$GITHUB_OUTPUT"
+          echo "Source credential mode: $source_mode; Tap credential mode: $tap_mode"
+
+      - name: Mint ephemeral source-read token
+        id: source_app
+        if: steps.auth_cfg.outputs.source_mode == 'app'
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ steps.auth_cfg.outputs.src_owner }}
+          repositories: ${{ steps.auth_cfg.outputs.src_repo }}
+          permission-actions: read
+          permission-contents: read
+
+      - name: Mint ephemeral Homebrew tap token
+        id: tap_app
+        if: steps.auth_cfg.outputs.tap_mode == 'app'
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: arenberg-engineering
+          repositories: homebrew-tap
+          permission-contents: write
+          permission-pull-requests: write
 
       - name: Verify the source run
         id: source
         env:
-          GH_TOKEN: ${{ secrets.ENGRA_SOURCE_READ_TOKEN }}
+          GH_TOKEN: ${{ steps.source_app.outputs.token || secrets.ENGRA_SOURCE_READ_TOKEN }}
           SRC: ${{ secrets.ENGRA_SOURCE_REPO }}
           TAG: ${{ steps.inputs.outputs.tag }}
           RUN_ID: ${{ steps.inputs.outputs.run_id }}
         run: |
           set -euo pipefail
           if [[ -z "${SRC:-}" || -z "${GH_TOKEN:-}" ]]; then
-            echo "::error::ENGRA_SOURCE_REPO and ENGRA_SOURCE_READ_TOKEN must be set in the release-publish environment"
+            echo "::error::source repository or credentials missing"
             exit 1
           fi
           # Resolve the tag to its commit (dereference annotated tags).
@@ -119,13 +222,15 @@ jobs:
             exit 1
           fi
           rm -f run.json
-          echo "run_id=$RUN_ID" >>"$GITHUB_OUTPUT"
-          echo "commit=$commit" >>"$GITHUB_OUTPUT"
+          {
+            echo "run_id=$RUN_ID"
+            echo "commit=$commit"
+          } >>"$GITHUB_OUTPUT"
           echo "source run $RUN_ID verified for $TAG at $commit"
 
       - name: Download the release bundle
         env:
-          GH_TOKEN: ${{ secrets.ENGRA_SOURCE_READ_TOKEN }}
+          GH_TOKEN: ${{ steps.source_app.outputs.token || secrets.ENGRA_SOURCE_READ_TOKEN }}
           SRC: ${{ secrets.ENGRA_SOURCE_REPO }}
           RUN_ID: ${{ steps.source.outputs.run_id }}
         run: gh run download "$RUN_ID" --repo "$SRC" --name release-bundle --dir bundle
@@ -163,12 +268,110 @@ jobs:
           done
           # Corporate-identity rule: the source owner never appears in public assets.
           owner="${SRC%%/*}"
+          echo "::add-mask::$owner"
           if grep -rqiF -- "$owner" --include='*.json' --include='*.md' --include='*.rb' --include='*.txt' --include=SHA256SUMS .; then
             echo "::error::a release text file names the source repository owner"; exit 1
           fi
           jq -r '.platforms | to_entries[] | "\(.key): signed=\(.value.signed) notarized=\(.value.notarized)"' signing-status.json
 
+      - name: Preflight Homebrew tap permissions and OIDC provenance readiness
+        env:
+          GH_TOKEN: ${{ steps.tap_app.outputs.token || secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_MODE: ${{ steps.auth_cfg.outputs.tap_mode }}
+          SRC_MODE: ${{ steps.auth_cfg.outputs.source_mode }}
+          VERSION: ${{ steps.inputs.outputs.version }}
+          TAG: ${{ steps.inputs.outputs.tag }}
+          DRY_RUN: ${{ steps.inputs.outputs.dry_run }}
+          RUN_ID: ${{ steps.source.outputs.run_id }}
+          COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          set -euo pipefail
+          [[ -n "${GH_TOKEN:-}" ]] || { echo "::error::tap credentials missing"; exit 1; }
+
+          # Verify Formula/engra.rb is readable in the tap repository.
+          gh api "repos/$TAP_REPO/contents/Formula/engra.rb" | jq -e '.type == "file"' >/dev/null || {
+            echo "::error::Formula/engra.rb is not readable in $TAP_REPO"
+            exit 1
+          }
+
+          # Verify tap write permissions without mutating the repository.
+          if [[ "$TAP_MODE" == "app" ]]; then
+            gh api "/installation/repositories?per_page=100" | jq -e --arg r "$TAP_REPO" '
+              .total_count == 1 and (.repositories | map(.full_name) == [$r]) and .repositories[0].permissions.push == true' >/dev/null || {
+              echo "::error::GitHub App token is not scoped exclusively to $TAP_REPO with push access"
+              exit 1
+            }
+            gh api "repos/$TAP_REPO/pulls?state=open&per_page=1" | jq -e 'type == "array"' >/dev/null || {
+              echo "::error::GitHub App token cannot query pull requests on $TAP_REPO"
+              exit 1
+            }
+          else
+            gh api "repos/$TAP_REPO" | jq -e '.permissions.push == true' >/dev/null || {
+              echo "::error::Token lacks push permissions on $TAP_REPO"
+              exit 1
+            }
+          fi
+
+          if [[ "$DRY_RUN" != "true" ]]; then
+            if gh api "repos/$TAP_REPO/branches/engra-$VERSION" >/dev/null 2>&1; then
+              echo "::error::$TAP_REPO already has branch engra-$VERSION"
+              exit 1
+            fi
+          fi
+
+          # Verify OIDC provenance signing readiness in-memory without printing or persisting the JWT.
+          if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" || -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]]; then
+            echo "::error::OIDC ID token request URL or token missing from environment"
+            exit 1
+          fi
+
+          curl -fsSL -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sigstore" | python3 -c '
+          import os, sys, json, base64
+
+          raw = sys.stdin.read().strip()
+          if not raw:
+              sys.exit("empty OIDC response")
+          data = json.loads(raw)
+          token = data.get("value")
+          if not token:
+              sys.exit("missing value in OIDC response")
+          parts = token.split(".")
+          if len(parts) != 3:
+              sys.exit("invalid JWT format")
+          payload = parts[1]
+          padding = 4 - (len(payload) % 4)
+          if padding != 4:
+              payload += "=" * padding
+          claims = json.loads(base64.urlsafe_b64decode(payload))
+          repo = os.environ.get("GITHUB_REPOSITORY")
+          got_repo = claims.get("repository")
+          got_env = claims.get("environment")
+          if got_repo != repo:
+              sys.exit(f"OIDC repository claim mismatch: {got_repo} != {repo}")
+          if got_env != "release-publish":
+              sys.exit(f"OIDC environment claim mismatch: {got_env} != release-publish")
+          print("OIDC provenance signing claim verified for release-publish")
+          '
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+            {
+              echo "### Dry-Run Validation Passed"
+              echo ""
+              echo "- **Tag:** \`$TAG\`"
+              echo "- **Source Commit:** \`$COMMIT\`"
+              echo "- **Source Run ID:** \`$RUN_ID\`"
+              echo "- **Source Credential Mode:** \`$SRC_MODE\`"
+              echo "- **Tap Credential Mode:** \`$TAP_MODE\`"
+              echo "- **Assets Verified:** 25 assets (SHA256SUMS, signing-status, build-info, licenses, archives, sboms)"
+              echo "- **OIDC Claim:** \`release-publish\` environment claim verified against Sigstore audience"
+              echo "- **Homebrew Tap:** \`$TAP_REPO\` write access preflight verified"
+              echo "- **Mutations:** Zero mutations performed (dry-run mode)"
+            } >>"$GITHUB_STEP_SUMMARY"
+            echo "Dry-run validation complete; skipping mutation steps."
+          fi
+
       - name: Refuse to overwrite an existing release
+        if: steps.inputs.outputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.inputs.outputs.tag }}
@@ -179,7 +382,8 @@ jobs:
           fi
 
       - name: Attest provenance
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        if: steps.inputs.outputs.dry_run != 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             bundle/engra-*.tar.gz
@@ -193,7 +397,29 @@ jobs:
             bundle/signing-status.json
             bundle/build-info.json
 
+      - name: Verify provenance attestations
+        if: steps.inputs.outputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.inputs.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 scripts/check_distribution.py assets --version "$VERSION" --dir bundle --print0 assets.list
+          count=0
+          while IFS= read -r -d '' f; do
+            gh attestation verify "$f" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish.yml" >/dev/null
+            count=$((count + 1))
+          done <assets.list
+          if (( count != 25 )); then
+            echo "::error::expected 25 verified attestations, got $count"
+            exit 1
+          fi
+          echo "Verified SLSA build provenance attestations for all $count release assets"
+
       - name: Create the GitHub Release
+        if: steps.inputs.outputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.inputs.outputs.tag }}
@@ -208,7 +434,8 @@ jobs:
             --title "Engra CLI $TAG" --notes-file bundle/RELEASE_NOTES.md --latest \
             -- "${assets[@]}"
 
-      - name: Published URLs serve the expected hashes
+      - name: Published URLs serve the expected hashes and verifiable provenance
+        if: steps.inputs.outputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.inputs.outputs.version }}
@@ -234,8 +461,11 @@ jobs:
           jq -e --arg v "$VERSION" --arg t "$TAG" --arg c "$COMMIT" \
             '.version == $v and .tag == $t and .source_commit == $c and .release == true' \
             published-build-info.json >/dev/null || { echo "::error::published build-info.json provenance mismatch"; exit 1; }
+          gh attestation verify published-build-info.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish.yml" >/dev/null
           rm -f published-build-info.json
-          echo "build-info.json OK"
+          echo "build-info.json OK (hash and attestation verified)"
           for p in $BREW_PLATFORMS; do
             name="engra-$VERSION-$p.tar.gz"
             want="$(awk -v n="$name" '$2 == n { print $1 }' bundle/SHA256SUMS)"
@@ -243,21 +473,31 @@ jobs:
             grep -q "sha256 \"$want\"" bundle/engra.rb
             got=""
             for _ in 1 2 3 4 5; do
-              got="$(curl -fsSL "$base/$name" | sha256sum | cut -d' ' -f1)" && [[ "$got" == "$want" ]] && break
+              if curl -fsSL "$base/$name" -o dl_tar; then
+                got="$(sha256sum dl_tar | cut -d' ' -f1)"
+                [[ "$got" == "$want" ]] && break
+              fi
               sleep 10
             done
             [[ "$got" == "$want" ]] || { echo "::error::$name hash mismatch at $base"; exit 1; }
-            echo "$name OK"
+            gh attestation verify dl_tar \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish.yml" >/dev/null
+            rm -f dl_tar
+            echo "$name OK (hash and attestation verified)"
           done
 
       - name: Open the Homebrew tap pull request
+        if: steps.inputs.outputs.dry_run != 'true'
         env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GH_TOKEN: ${{ steps.tap_app.outputs.token || secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_MODE: ${{ steps.auth_cfg.outputs.tap_mode }}
+          APP_SLUG: ${{ steps.tap_app.outputs.app-slug }}
           VERSION: ${{ steps.inputs.outputs.version }}
           TAG: ${{ steps.inputs.outputs.tag }}
         run: |
           set -euo pipefail
-          [[ -n "${GH_TOKEN:-}" ]] || { echo "::error::HOMEBREW_TAP_TOKEN is not set"; exit 1; }
+          [[ -n "${GH_TOKEN:-}" ]] || { echo "::error::tap credentials missing"; exit 1; }
           branch="engra-$VERSION"
           if gh api "repos/$TAP_REPO/branches/$branch" >/dev/null 2>&1; then
             echo "::error::$TAP_REPO already has branch $branch"; exit 1
@@ -267,11 +507,17 @@ jobs:
           cd tap
           git switch -c "$branch"
           cp ../bundle/engra.rb Formula/engra.rb
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [[ "$TAP_MODE" == "app" && -n "${APP_SLUG:-}" ]]; then
+            bot_id="$(gh api "users/${APP_SLUG}%5Bbot%5D" --jq '.id')"
+            git config user.name "${APP_SLUG}[bot]"
+            git config user.email "${bot_id}+${APP_SLUG}[bot]@users.noreply.github.com"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          fi
           git add Formula/engra.rb
           git commit -m "engra $VERSION"
           git push origin "$branch"
           gh pr create --repo "$TAP_REPO" --base main --head "$branch" \
             --title "engra $VERSION" \
-            --body "Generated by the engra-releases publish workflow for [$TAG](https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG). Every URL and sha256 was checked against the published release and its SHA256SUMS. After merging, run the brew-acceptance workflow for $VERSION."
+            --body "Generated by the engra-releases publish workflow for [$TAG](https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG). All 25 release assets are SHA-256 checksummed and SLSA build provenance-attested. Every formula URL, hash, and attestation was verified against the published release. After merging, run the brew-acceptance workflow for $VERSION."
