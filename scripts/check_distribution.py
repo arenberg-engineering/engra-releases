@@ -32,6 +32,8 @@ Rules:
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import io
 import json
 import posixpath
@@ -456,6 +458,15 @@ def expected_desktop_assets(version: str) -> list[str]:
     )
 
 
+UPDATER_FILENAMES = {
+    "darwin-aarch64": "Engra_{version}_aarch64.app.tar.gz",
+    "darwin-x86_64": "Engra_{version}_x64.app.tar.gz",
+    "windows-x86_64": "Engra_{version}_x64-setup.exe",
+    "linux-x86_64": "Engra_{version}_amd64.AppImage",
+}
+_SHA256SUMS_LINE_RE = re.compile(r"^([0-9a-f]{64})  \*?([A-Za-z0-9._-]+)$", re.ASCII)
+
+
 def check_desktop_build_info(data: bytes, version: str) -> None:
     try:
         info = json.loads(data)
@@ -475,8 +486,8 @@ def check_desktop_build_info(data: bytes, version: str) -> None:
     commit = info.get("source_commit")
     if not isinstance(commit, str) or not _COMMIT_SHA_RE.fullmatch(commit):
         raise Reject(f"build-info.json: invalid 40-hex source_commit {commit!r}")
-    if not isinstance(info.get("release"), bool):
-        raise Reject("build-info.json: release field must be a boolean")
+    if info.get("release") is not True:
+        raise Reject("build-info.json release must be true")
     if info.get("distribution") != "arenberg-engineering/engra-releases":
         raise Reject(
             f"build-info.json: distribution {info.get('distribution')!r} != 'arenberg-engineering/engra-releases'"
@@ -509,9 +520,11 @@ def check_desktop_latest_manifest(data: bytes, version: str) -> None:
         if not isinstance(p_info, dict):
             raise Reject(f"latest.json: platforms[{target!r}] must be a JSON object")
         url = p_info.get("url")
-        if not isinstance(url, str) or not url.startswith("https://"):
+        expected_fn = UPDATER_FILENAMES[target].format(version=version)
+        expected_url = f"https://github.com/arenberg-engineering/engra-releases/releases/download/desktop-v{version}/{expected_fn}"
+        if url != expected_url:
             raise Reject(
-                f"latest.json: platforms[{target!r}].url must be a valid https URL (got {url!r})"
+                f"latest.json: platforms[{target!r}].url {url!r} != {expected_url!r}"
             )
         sig = p_info.get("signature")
         if not isinstance(sig, str) or not sig.strip():
@@ -566,6 +579,73 @@ def check_desktop_signing_status(data: bytes, version: str) -> None:
             )
 
 
+def check_desktop_sha256sums(directory: Path, version: str) -> None:
+    sums_path = directory / "SHA256SUMS"
+    if not sums_path.is_file() or sums_path.is_symlink():
+        raise Reject("missing or not a regular file: SHA256SUMS")
+    lines = [
+        ln.strip()
+        for ln in sums_path.read_text(encoding="utf-8").splitlines()
+        if ln.strip()
+    ]
+    if not lines:
+        raise Reject("SHA256SUMS is empty")
+
+    allowed = set(expected_desktop_assets(version)) - {"SHA256SUMS"}
+    listed: dict[str, str] = {}
+    for ln in lines:
+        m = _SHA256SUMS_LINE_RE.fullmatch(ln)
+        if not m:
+            raise Reject(f"invalid SHA256SUMS line format: {ln!r}")
+        digest, name = m.group(1), m.group(2)
+        if name not in allowed:
+            raise Reject(f"SHA256SUMS lists unexpected file {name!r}")
+        if name in listed:
+            raise Reject(f"duplicate entry in SHA256SUMS: {name!r}")
+        listed[name] = digest
+
+    v_parts = [int(p) for p in version.split(".")]
+    v_tuple = (v_parts[0], v_parts[1], v_parts[2])
+
+    baseline_10 = {
+        f"Engra_{version}_aarch64.dmg",
+        f"Engra_{version}_aarch64.app.tar.gz",
+        f"Engra_{version}_x64.dmg",
+        f"Engra_{version}_x64.app.tar.gz",
+        f"Engra_{version}_x64-setup.exe",
+        f"Engra_{version}_x64_en-US.msi",
+        f"Engra_{version}_amd64.deb",
+        f"Engra-{version}-1.x86_64.rpm",
+        f"Engra_{version}_amd64.AppImage",
+        "latest.json",
+    }
+
+    if v_tuple >= (0, 4, 67):
+        if set(listed.keys()) != allowed:
+            missing = sorted(allowed - set(listed.keys()))
+            raise Reject(f"SHA256SUMS incomplete for v{version}: missing {missing!r}")
+    else:
+        if not baseline_10.issubset(set(listed.keys())):
+            missing = sorted(baseline_10 - set(listed.keys()))
+            raise Reject(
+                f"SHA256SUMS incomplete for v{version}: missing baseline {missing!r}"
+            )
+
+    for name, expected_hash in listed.items():
+        file_path = directory / name
+        if not file_path.is_file():
+            raise Reject(f"file listed in SHA256SUMS not found: {name}")
+        h = hashlib.sha256()
+        with file_path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                h.update(chunk)
+        actual_hash = h.hexdigest()
+        if actual_hash != expected_hash:
+            raise Reject(
+                f"SHA-256 hash mismatch for {name}: {actual_hash} != {expected_hash}"
+            )
+
+
 def check_desktop_assets(
     version: str, directory: Path, *, forbid_handle: str | None = None
 ) -> list[str]:
@@ -595,6 +675,8 @@ def check_desktop_assets(
         elif name.endswith(".sig"):
             if not data.strip():
                 raise Reject(f"{name}: empty signature file")
+
+    check_desktop_sha256sums(directory, version)
 
     if forbid_handle:
         handle_lower = forbid_handle.strip().lower()
@@ -762,7 +844,9 @@ def _write_valid_bundle(d: Path, version: str, *, onedir: bool = False) -> None:
                         tf.addfile(sinfo)
 
 
-def _write_valid_desktop_bundle(d: Path, version: str) -> None:
+def _write_valid_desktop_bundle(
+    d: Path, version: str, *, full_sums: bool = True
+) -> None:
     expected = expected_desktop_assets(version)
     pub_date = "2026-11-25T12:00:00Z"
     expires_at = "2026-12-09T12:00:00Z"
@@ -770,7 +854,9 @@ def _write_valid_desktop_bundle(d: Path, version: str) -> None:
         f"# Engra Desktop v{version}\n\nNotes.\n", encoding="utf-8"
     )
     for name in expected:
-        if name == "build-info.json":
+        if name == "SHA256SUMS":
+            continue
+        elif name == "build-info.json":
             (d / name).write_text(
                 json.dumps(
                     {
@@ -851,13 +937,29 @@ def _write_valid_desktop_bundle(d: Path, version: str) -> None:
                 "untrusted comment: minisign signature\nsig\ntrusted comment: version:0.4.66\nglobalsig\n",
                 encoding="utf-8",
             )
-        elif name == "SHA256SUMS":
-            (d / name).write_text(
-                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  latest.json\n",
-                encoding="utf-8",
-            )
         else:
             (d / name).write_bytes(b"installer binary stub\n")
+
+    baseline_10 = [
+        f"Engra_{version}_aarch64.dmg",
+        f"Engra_{version}_aarch64.app.tar.gz",
+        f"Engra_{version}_x64.dmg",
+        f"Engra_{version}_x64.app.tar.gz",
+        f"Engra_{version}_x64-setup.exe",
+        f"Engra_{version}_x64_en-US.msi",
+        f"Engra_{version}_amd64.deb",
+        f"Engra-{version}-1.x86_64.rpm",
+        f"Engra_{version}_amd64.AppImage",
+        "latest.json",
+    ]
+    target_names = (
+        [n for n in expected if n != "SHA256SUMS"] if full_sums else baseline_10
+    )
+    sum_lines = []
+    for n in sorted(target_names):
+        h = hashlib.sha256((d / n).read_bytes()).hexdigest()
+        sum_lines.append(f"{h}  {n}")
+    (d / "SHA256SUMS").write_text("\n".join(sum_lines) + "\n", encoding="utf-8")
 
 
 def selftest() -> None:
@@ -1207,14 +1309,66 @@ def selftest() -> None:
         bi_path.write_bytes(good_bi)
         check_assets(onedir_v, od)
         # 12. Desktop bundle and release validation checks.
-        desk_v = "0.4.66"
+        # (a) Minisign public key endianness check.
+        pinned_pub_b64 = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDA4RjNFMTY5MjA3NjkxRjQKUldUMGtYWWdhZUh6Q05YTmhSUHF2V1JqMHJLby85WjdodDE5WmxWUDRjcmdUQnNJVi80UWlNREwK"
+        pub_text = base64.b64decode(pinned_pub_b64).decode("utf-8")
+        pub_raw = base64.b64decode(pub_text.splitlines()[1].strip())
+        keynum = pub_raw[2:10]
+        if keynum[::-1].hex().upper() != "08F3E169207691F4":
+            raise SystemExit(
+                f"[selftest] Minisign little-endian Key ID mismatch: {keynum[::-1].hex().upper()} != 08F3E169207691F4"
+            )
+        print("[selftest] Minisign little-endian Key ID verified (08F3E169207691F4)")
+
+        # (b) Valid v0.4.66 10-entry bundle accepted.
+        v66 = "0.4.66"
+        dd66 = d / "desktop66"
+        dd66.mkdir()
+        _write_valid_desktop_bundle(dd66, v66, full_sums=False)
+        check_desktop_assets(v66, dd66, forbid_handle="someone")
+        print("[selftest] valid v0.4.66 10-entry desktop bundle accepted")
+
+        # (c) Valid v0.4.67 16-entry bundle accepted.
+        desk_v = "0.4.67"
         dd = d / "desktop"
         dd.mkdir()
-        _write_valid_desktop_bundle(dd, desk_v)
+        _write_valid_desktop_bundle(dd, desk_v, full_sums=True)
         check_desktop_assets(desk_v, dd, forbid_handle="someone")
-        print("[selftest] valid desktop bundle accepted")
+        print("[selftest] valid v0.4.67 16-entry desktop bundle accepted")
 
-        # (a) Missing RELEASE_NOTES.md -> rejected.
+        # (d) v0.4.67 bundle with 10-entry SHA256SUMS -> rejected (16-entry required).
+        dd67_incomplete = d / "desktop67_incomplete"
+        dd67_incomplete.mkdir()
+        _write_valid_desktop_bundle(dd67_incomplete, desk_v, full_sums=False)
+        must_fail(
+            "incomplete SHA256SUMS for v0.4.67+",
+            lambda: check_desktop_assets(desk_v, dd67_incomplete),
+        )
+
+        # (e) Path traversal in SHA256SUMS -> rejected.
+        good_sums = (dd / "SHA256SUMS").read_bytes()
+        (dd / "SHA256SUMS").write_text(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  ../evil\n",
+            encoding="utf-8",
+        )
+        must_fail(
+            "path traversal in SHA256SUMS",
+            lambda: check_desktop_assets(desk_v, dd),
+        )
+        (dd / "SHA256SUMS").write_bytes(good_sums)
+
+        # (f) Checksum mismatch in SHA256SUMS -> rejected.
+        (dd / "SHA256SUMS").write_text(
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  latest.json\n",
+            encoding="utf-8",
+        )
+        must_fail(
+            "checksum mismatch in SHA256SUMS",
+            lambda: check_desktop_assets(desk_v, dd),
+        )
+        (dd / "SHA256SUMS").write_bytes(good_sums)
+
+        # (g) Missing RELEASE_NOTES.md -> rejected.
         (dd / "RELEASE_NOTES.md").unlink()
         must_fail(
             "missing RELEASE_NOTES.md in desktop bundle",
@@ -1222,7 +1376,7 @@ def selftest() -> None:
         )
         (dd / "RELEASE_NOTES.md").write_text("# Notes\n", encoding="utf-8")
 
-        # (b) Secret in RELEASE_NOTES.md -> rejected.
+        # (h) Secret in RELEASE_NOTES.md -> rejected.
         (dd / "RELEASE_NOTES.md").write_text(f"Key: {fake_stripe}\n", encoding="utf-8")
         must_fail(
             "secret in RELEASE_NOTES.md",
@@ -1230,7 +1384,7 @@ def selftest() -> None:
         )
         (dd / "RELEASE_NOTES.md").write_text("# Notes\n", encoding="utf-8")
 
-        # (c) Secret in latest.json -> rejected.
+        # (i) Secret in latest.json -> rejected.
         good_latest = (dd / "latest.json").read_bytes()
         (dd / "latest.json").write_text(
             json.dumps({"version": desk_v, "notes": fake_stripe}),
@@ -1242,7 +1396,19 @@ def selftest() -> None:
         )
         (dd / "latest.json").write_bytes(good_latest)
 
-        # (d) Forbidden handle in build-info.json -> rejected when forbid_handle passed.
+        # (j) Wrong platform URL in latest.json -> rejected.
+        bad_latest_url = json.loads(good_latest)
+        bad_latest_url["platforms"]["darwin-aarch64"]["url"] = (
+            "https://evil.com/Engra.dmg"
+        )
+        (dd / "latest.json").write_text(json.dumps(bad_latest_url), encoding="utf-8")
+        must_fail(
+            "wrong platform URL in latest.json",
+            lambda: check_desktop_assets(desk_v, dd),
+        )
+        (dd / "latest.json").write_bytes(good_latest)
+
+        # (k) Forbidden handle in build-info.json -> rejected when forbid_handle passed.
         good_bi_desk = (dd / "build-info.json").read_bytes()
         bad_bi = json.loads(good_bi_desk)
         bad_bi["maintainer"] = "forbidden_user"
@@ -1253,7 +1419,7 @@ def selftest() -> None:
         )
         (dd / "build-info.json").write_bytes(good_bi_desk)
 
-        # (e) Invalid product in build-info.json -> rejected.
+        # (l) Invalid product in build-info.json -> rejected.
         bad_bi = json.loads(good_bi_desk)
         bad_bi["product"] = "engra-cli"
         (dd / "build-info.json").write_text(json.dumps(bad_bi), encoding="utf-8")
@@ -1263,7 +1429,17 @@ def selftest() -> None:
         )
         (dd / "build-info.json").write_bytes(good_bi_desk)
 
-        # (f) Unsigned macOS in signing-status.json -> rejected.
+        # (m) release: False in build-info.json -> rejected.
+        bad_bi = json.loads(good_bi_desk)
+        bad_bi["release"] = False
+        (dd / "build-info.json").write_text(json.dumps(bad_bi), encoding="utf-8")
+        must_fail(
+            "release: False in desktop build-info.json",
+            lambda: check_desktop_assets(desk_v, dd),
+        )
+        (dd / "build-info.json").write_bytes(good_bi_desk)
+
+        # (n) Unsigned macOS in signing-status.json -> rejected.
         good_ss = (dd / "signing-status.json").read_bytes()
         bad_ss = json.loads(good_ss)
         bad_ss["platforms"]["macos-arm64"]["signed"] = False
@@ -1274,7 +1450,7 @@ def selftest() -> None:
         )
         (dd / "signing-status.json").write_bytes(good_ss)
 
-        # (g) Missing target platform in latest.json -> rejected.
+        # (o) Missing target platform in latest.json -> rejected.
         bad_latest = json.loads(good_latest)
         del bad_latest["platforms"]["darwin-aarch64"]
         (dd / "latest.json").write_text(json.dumps(bad_latest), encoding="utf-8")
@@ -1284,7 +1460,7 @@ def selftest() -> None:
         )
         (dd / "latest.json").write_bytes(good_latest)
 
-        # (h) Empty signature file -> rejected.
+        # (p) Empty signature file -> rejected.
         sig_file = dd / f"Engra_{desk_v}_aarch64.app.tar.gz.sig"
         good_sig = sig_file.read_bytes()
         sig_file.write_text("   \n", encoding="utf-8")
@@ -1294,7 +1470,7 @@ def selftest() -> None:
         )
         sig_file.write_bytes(good_sig)
 
-        # (i) Valid desktop release JSON -> accepted.
+        # (q) Valid desktop release JSON -> accepted.
         expected_desk = expected_desktop_assets(desk_v)
         valid_rel = {
             "tag_name": f"desktop-v{desk_v}",
@@ -1310,7 +1486,7 @@ def selftest() -> None:
         check_desktop_release_json(desk_v, dd / "rel.json")
         print("[selftest] valid desktop release JSON accepted")
 
-        # (j) Release JSON with wrong tag / draft / prerelease / author / uploader / extra / missing.
+        # (r) Release JSON with wrong tag / draft / prerelease / author / uploader / extra / missing.
         for bad_label, bad_rel_patch in (
             ("wrong tag", {"tag_name": f"v{desk_v}"}),
             ("draft release", {"draft": True}),

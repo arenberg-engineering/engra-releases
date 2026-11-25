@@ -3,19 +3,19 @@
 # Started by workflow_dispatch for one desktop tag (desktop-vX.Y.Z).
 # The job runs in the `release-publish` environment, requiring approval
 # before any secret is available. It then:
-#   1. checks that the source `desktop-release` run is a successful run of
-#      that exact ref/tag in the private source repository;
+#   1. checks that the source `desktop-release` run is a successful tag-push run of
+#      that exact ref/tag in the private source repository, whose commit is on main;
 #   2. downloads that run's `desktop-release-bundle` artifact and checks
 #      its checksums, 17-asset set, build-info, Developer ID / Apple Notary
 #      signing status, and Ed25519 Minisign version-bound updater signatures;
-#   3. preflights OIDC provenance readiness;
+#   3. preflights OIDC provenance readiness and updater channel rollback safety;
 #   4. attests provenance for every asset (verifiable by anyone with
 #      `gh attestation verify <asset> --repo arenberg-engineering/engra-releases`);
 #   5. creates or updates the GitHub Release `desktop-vX.Y.Z` with `--latest=false`
 #      so CLI releases remain the repository's Latest;
 #   6. verifies published URLs, hashes, and provenance attestations;
-#   7. updates the `desktop-stable` updater channel release (enforcing monotonic
-#      SemVer unless allow_rollback_floor=true is explicitly set).
+#   7. updates the `desktop-stable` updater channel release with `--prerelease --latest=false`
+#      (enforcing monotonic SemVer unless allow_rollback_floor=true is explicitly set).
 #
 # Environment secrets (release-publish only, referenced by name):
 #   ENGRA_SOURCE_REPO        owner/name of the private source repository (kept
@@ -110,6 +110,10 @@ jobs:
             echo "::error::allow_rollback_floor must be boolean (true or false)"; exit 1
           fi
           effective_source_ref="${SOURCE_REF:-$TAG}"
+          if [[ ! "$effective_source_ref" =~ ^(v${version}|desktop-v${version}(\+[0-9A-Za-z.-]+)?)$ ]]; then
+            echo "::error::source_ref must be desktop-v${version}, desktop-v${version}+<build>, or v${version}"
+            exit 1
+          fi
           {
             echo "tag=$TAG"
             echo "version=$version"
@@ -190,21 +194,34 @@ jobs:
             echo "::error::source repository or credentials missing"
             exit 1
           fi
+          # Resolve the source tag to its commit (dereference annotated tags).
+          read -r obj_type obj_sha < <(gh api "repos/$SRC/git/ref/tags/$SOURCE_REF" --jq '.object.type + " " + .object.sha')
+          if [[ "$obj_type" == "tag" ]]; then
+            commit="$(gh api "repos/$SRC/git/tags/$obj_sha" --jq '.object.sha')"
+          else
+            commit="$obj_sha"
+          fi
           gh api "repos/$SRC/actions/runs/$RUN_ID" >run.json
-          jq -e --arg ref "$SOURCE_REF" '
+          jq -e --arg ref "$SOURCE_REF" --arg sha "$commit" '
             .path == ".github/workflows/desktop-release.yml" and
-            .head_branch == $ref and
-            .status == "completed" and .conclusion == "success"' run.json >/dev/null || {
-            echo "::error::run $RUN_ID is not a successful desktop-release run for ref $SOURCE_REF"
+            .event == "push" and .head_branch == $ref and
+            .status == "completed" and .conclusion == "success" and
+            .head_sha == $sha' run.json >/dev/null || {
+            echo "::error::run $RUN_ID is not a successful desktop-release tag-push run of $SOURCE_REF at commit $commit"
             exit 1
           }
-          head_sha="$(jq -r .head_sha run.json)"
+          # The source commit must be on main: main is identical to or ahead of it.
+          rel="$(gh api "repos/$SRC/compare/$commit...main" --jq '.status')"
+          if [[ "$rel" != "identical" && "$rel" != "ahead" ]]; then
+            echo "::error::source tag commit $commit is not on main branch (compare: $rel)"
+            exit 1
+          fi
           rm -f run.json
           {
             echo "run_id=$RUN_ID"
-            echo "commit=$head_sha"
+            echo "commit=$commit"
           } >>"$GITHUB_OUTPUT"
-          echo "source run $RUN_ID verified for $SOURCE_REF at $head_sha"
+          echo "source run $RUN_ID verified for $SOURCE_REF at $commit"
 
       - name: Download the desktop release bundle
         env:
@@ -217,6 +234,7 @@ jobs:
         env:
           SRC: ${{ secrets.ENGRA_SOURCE_REPO }}
           VERSION: ${{ steps.inputs.outputs.version }}
+          COMMIT: ${{ steps.source.outputs.commit }}
           PUBKEY_BASE64: ${{ env.PUBKEY_BASE64 }}
           EXPECTED_KEY_ID: ${{ env.EXPECTED_KEY_ID }}
         run: |
@@ -224,17 +242,24 @@ jobs:
           owner="${SRC%%/*}"
           echo "::add-mask::$owner"
 
-          # 1. Distribution validator check for desktop-assets
+          # 1. Distribution validator check for desktop-assets (and SHA256SUMS confinement/completeness)
           python3 scripts/check_distribution.py desktop-assets \
             --version "$VERSION" \
             --dir bundle \
             --print0 assets.list \
             --forbid-handle "$owner"
 
-          # 2. Check SHA256SUMS
+          # 2. Check SHA256SUMS with sha256sum utility
           (cd bundle && sha256sum -c SHA256SUMS)
 
-          # 3. Verify signing-status.json
+          # 3. Verify build-info.json matches source commit and release=true
+          jq -e --arg c "$COMMIT" '.source_commit == $c and .release == true' \
+            bundle/build-info.json >/dev/null || {
+            echo "::error::build-info.json source_commit does not match $COMMIT or release is not true"
+            exit 1
+          }
+
+          # 4. Verify signing-status.json
           for p in macos-arm64 macos-x64; do
             jq -e --arg p "$p" '.platforms[$p].signed == true and .platforms[$p].notarized == true' \
               bundle/signing-status.json >/dev/null || {
@@ -248,8 +273,8 @@ jobs:
             exit 1
           }
 
-          # 4. Pure-Python Ed25519 + BLAKE2b-512 Minisign signature & version binding verification
-          python3 -m pip install --quiet "cryptography>=44,<47"
+          # 5. Pure-Python Ed25519 + BLAKE2b-512 Minisign signature, version binding, and latest.json signature exact match
+          python3 -c "import cryptography" 2>/dev/null || (sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends python3-cryptography)
           python3 - << 'EOF'
           import os, sys, json, base64, hashlib
           from pathlib import Path
@@ -268,25 +293,38 @@ jobs:
           if len(pub_raw) != 42 or pub_raw[:2] != b"Ed":
               sys.exit("Minisign public key must be 42-byte Ed25519 payload")
           pub_keynum = pub_raw[2:10]
-          if pub_keynum.hex().upper() != expected_kid.upper():
-              sys.exit(f"Key ID mismatch: {pub_keynum.hex().upper()} != {expected_kid.upper()}")
+          if pub_keynum[::-1].hex().upper() != expected_kid.upper():
+              sys.exit(f"Key ID mismatch: {pub_keynum[::-1].hex().upper()} != {expected_kid.upper()}")
           vk = Ed25519PublicKey.from_public_bytes(pub_raw[10:])
 
-          updater_targets = [
-              f"Engra_{version}_aarch64.app.tar.gz",
-              f"Engra_{version}_x64.app.tar.gz",
-              f"Engra_{version}_x64-setup.exe",
-              f"Engra_{version}_amd64.AppImage",
-          ]
-
           bundle_dir = Path("bundle")
-          for target_name in updater_targets:
+          latest_path = bundle_dir / "latest.json"
+          if not latest_path.is_file():
+              sys.exit("Missing bundle/latest.json")
+          latest_data = json.loads(latest_path.read_text(encoding="utf-8"))
+          latest_platforms = latest_data.get("platforms") or {}
+
+          updater_target_map = {
+              "darwin-aarch64": f"Engra_{version}_aarch64.app.tar.gz",
+              "darwin-x86_64": f"Engra_{version}_x64.app.tar.gz",
+              "windows-x86_64": f"Engra_{version}_x64-setup.exe",
+              "linux-x86_64": f"Engra_{version}_amd64.AppImage",
+          }
+
+          for target_key, target_name in updater_target_map.items():
               art_path = bundle_dir / target_name
               sig_path = bundle_dir / f"{target_name}.sig"
               if not art_path.is_file() or not sig_path.is_file():
                   sys.exit(f"Missing artifact or signature for {target_name}")
 
               sig_raw_text = sig_path.read_text(encoding="utf-8").strip()
+              p_info = latest_platforms.get(target_key)
+              if not isinstance(p_info, dict):
+                  sys.exit(f"Missing latest.json platforms[{target_key!r}]")
+              manifest_sig = p_info.get("signature", "").strip()
+              if manifest_sig != sig_raw_text:
+                  sys.exit(f"latest.json signature for {target_key} does not match {sig_path.name}")
+
               decoded = base64.b64decode(sig_raw_text, validate=True).decode("utf-8")
               lines = [ln.rstrip("\r\n") for ln in decoded.splitlines() if ln.strip()]
               if len(lines) < 4 or not lines[2].startswith("trusted comment: "):
@@ -331,13 +369,14 @@ jobs:
               signed_ver = fields.get("version", "").lstrip("v")
               if signed_ver != version.lstrip("v"):
                   sys.exit(f"Signed version mismatch in {sig_path.name}: {signed_ver!r} != {version!r}")
-              print(f"Verified Minisign signature and trusted version {signed_ver} for {target_name}")
+              print(f"Verified Minisign signature, trusted version {signed_ver}, and latest.json binding for {target_name}")
 
           print("All 4 desktop updater signatures verified successfully")
           EOF
 
-      - name: Preflight OIDC provenance readiness
+      - name: Preflight OIDC provenance readiness and updater channel rollback safety
         env:
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.inputs.outputs.tag }}
           VERSION: ${{ steps.inputs.outputs.version }}
           SOURCE_REF: ${{ steps.inputs.outputs.source_ref }}
@@ -379,6 +418,72 @@ jobs:
               sys.exit(f"OIDC environment claim mismatch: {got_env} != release-publish")
           print("OIDC provenance signing claim verified for release-publish")
           '
+
+          STABLE_TAG="desktop-stable"
+          has_stable=false
+          cur_ver=""
+
+          http_status="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" --jq '.id' >/dev/null 2>api_err.txt && echo 200 || grep -oE '[0-9]{3}' api_err.txt | head -n1 || echo 500)"
+          rm -f api_err.txt
+          if [[ "$http_status" == "200" ]]; then
+            has_stable=true
+            if ! curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/$STABLE_TAG/latest.json" -o cur_latest.json; then
+              if [[ "$ALLOW_ROLLBACK" != "true" ]]; then
+                echo "::error::Failed to download desktop-stable/latest.json; failing closed"
+                exit 1
+              fi
+            else
+              cur_ver="$(jq -r '.version // empty' cur_latest.json)"
+              rm -f cur_latest.json
+              if [[ -z "$cur_ver" && "$ALLOW_ROLLBACK" != "true" ]]; then
+                echo "::error::desktop-stable/latest.json has missing or empty version; failing closed"
+                exit 1
+              fi
+            fi
+          elif [[ "$http_status" != "404" ]]; then
+            echo "::error::GitHub API error checking desktop-stable release (HTTP $http_status)"
+            exit 1
+          fi
+
+          CURRENT_VER="$cur_ver" python3 - << 'EOF'
+          import os, sys
+
+          new_ver = os.environ["VERSION"]
+          cur_ver = os.environ.get("CURRENT_VER", "").strip()
+          allow_rollback = os.environ.get("ALLOW_ROLLBACK", "false").lower() == "true"
+
+          def parse_semver(v: str) -> tuple[int, int, int]:
+              parts = v.lstrip("v").split("+")[0].split("-")[0].split(".")
+              return (int(parts[0]), int(parts[1]), int(parts[2]))
+
+          if cur_ver:
+              new_tuple = parse_semver(new_ver)
+              cur_tuple = parse_semver(cur_ver)
+              if new_tuple < cur_tuple:
+                  if not allow_rollback:
+                      sys.exit(f"::error::Rollback floor violation: new version {new_ver} < current desktop-stable version {cur_ver}. Set allow_rollback_floor=true to override.")
+                  else:
+                      print(f"::warning::Rollback allowed: {new_ver} < {cur_ver} with allow_rollback_floor=true")
+              else:
+                  print(f"Preflight SemVer verified: {new_ver} >= {cur_ver}")
+          else:
+              print(f"Preflight: Initial desktop-stable release channel creation for {new_ver}")
+          EOF
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json author >rel_view.json 2>/dev/null; then
+            rel_author="$(jq -r '.author.login // empty' rel_view.json)"
+            rm -f rel_view.json
+            if [[ "$rel_author" != "github-actions[bot]" && "$has_stable" == "true" && -n "$cur_ver" ]]; then
+              if curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/$STABLE_TAG/latest.json" -o stable_chk.json 2>/dev/null; then
+                if grep -qF "/releases/download/$TAG/" stable_chk.json && [[ "$ALLOW_ROLLBACK" != "true" ]]; then
+                  echo "::error::desktop-stable updater channel currently points to active release $TAG authored by $rel_author; refusing to delete $TAG without allow_rollback_floor=true"
+                  rm -f stable_chk.json
+                  exit 1
+                fi
+                rm -f stable_chk.json
+              fi
+            fi
+          fi
 
           if [[ "$DRY_RUN" == "true" ]]; then
             {
@@ -454,7 +559,7 @@ jobs:
           if [[ "$exists" == "true" ]]; then
             if [[ "$rel_author" != "github-actions[bot]" ]]; then
               echo "Existing release $TAG author is $rel_author; deleting release object to recreate as github-actions[bot]"
-              gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes
+              gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
               gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target main \
                 --title "Engra Desktop $TAG" --notes-file bundle/RELEASE_NOTES.md --latest=false \
                 -- "${assets[@]}"
@@ -474,6 +579,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.inputs.outputs.tag }}
           VERSION: ${{ steps.inputs.outputs.version }}
+          COMMIT: ${{ steps.source.outputs.commit }}
         run: |
           set -euo pipefail
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" >release.json
@@ -481,15 +587,35 @@ jobs:
           rm -f release.json
 
           base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+
+          # Verify published build-info.json
+          for _ in 1 2 3 4 5; do
+            if curl -fsSL "$base/build-info.json" -o published-build-info.json; then
+              break
+            fi
+            sleep 10
+          done
+          test -f published-build-info.json
+          jq -e --arg c "$COMMIT" '.source_commit == $c and .release == true' \
+            published-build-info.json >/dev/null || {
+            echo "::error::published build-info.json does not match commit $COMMIT or release is not true"
+            exit 1
+          }
+          gh attestation verify published-build-info.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish-desktop.yml" >/dev/null
+          rm -f published-build-info.json
+
           updater_files=(
             "Engra_${VERSION}_aarch64.app.tar.gz"
             "Engra_${VERSION}_x64.app.tar.gz"
             "Engra_${VERSION}_x64-setup.exe"
             "Engra_${VERSION}_amd64.AppImage"
+            "latest.json"
           )
 
           for name in "${updater_files[@]}"; do
-            want="$(awk -v n="$name" '$2 == n { print $1 }' bundle/SHA256SUMS)"
+            want="$(awk -v n="$name" '($2 == n || $2 == "*" n) { print $1 }' bundle/SHA256SUMS)"
             [[ -n "$want" ]] || { echo "::error::$name missing from bundle/SHA256SUMS"; exit 1; }
             got=""
             for _ in 1 2 3 4 5; do
@@ -520,15 +646,16 @@ jobs:
           stable_author=""
           current_ver=""
 
-          if gh release view "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" --json author >stable_view.json 2>/dev/null; then
+          http_status="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" --jq '.id' >/dev/null 2>api_err.txt && echo 200 || grep -oE '[0-9]{3}' api_err.txt | head -n1 || echo 500)"
+          rm -f api_err.txt
+          if [[ "$http_status" == "200" ]]; then
             has_stable=true
-            stable_author="$(jq -r '.author.login // empty' stable_view.json)"
-            if curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/$STABLE_TAG/latest.json" -o cur_latest.json 2>/dev/null; then
+            stable_author="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" --jq '.author.login // empty')"
+            if curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/$STABLE_TAG/latest.json" -o cur_latest.json; then
               current_ver="$(jq -r '.version // empty' cur_latest.json)"
+              rm -f cur_latest.json
             fi
-            rm -f cur_latest.json
           fi
-          rm -f stable_view.json
 
           # Enforce Monotonic SemVer check
           CURRENT_VER="$current_ver" python3 - << 'EOF'
@@ -559,11 +686,12 @@ jobs:
           if [[ "$has_stable" != "true" || "$stable_author" != "github-actions[bot]" ]]; then
             if [[ "$has_stable" == "true" ]]; then
               echo "Deleting non-bot desktop-stable release"
-              gh release delete "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+              gh release delete "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
             fi
             gh release create "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" --target main \
               --title "Engra Desktop Stable Updater Channel" \
               --notes "Signed stable Tauri updater channel manifest." \
+              --prerelease \
               --latest=false \
               bundle/latest.json bundle/SHA256SUMS
           else
@@ -571,14 +699,23 @@ jobs:
               bundle/latest.json bundle/SHA256SUMS
           fi
 
-          # Verify desktop-stable release author and asset uploaders
+          # Verify desktop-stable release author, prerelease flag, and asset uploaders
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" >stable-release.json
           jq -e '
             .author.login == "github-actions[bot]" and
+            .prerelease == true and
             ([.assets[].name] | sort == ["SHA256SUMS", "latest.json"]) and
             ([.assets[].uploader.login] | all(. == "github-actions[bot]"))' stable-release.json >/dev/null || {
-            echo "::error::desktop-stable release author or asset uploader is not github-actions[bot]"
+            echo "::error::desktop-stable release author, prerelease flag, or asset uploader verification failed"
             exit 1
           }
           rm -f stable-release.json
           echo "desktop-stable updater channel release verified successfully"
+
+          # Prove repository Latest release is preserved as CLI vX.Y.Z
+          latest_cli="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')"
+          if [[ ! "$latest_cli" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Repository Latest is $latest_cli (expected CLI vX.Y.Z)"
+            exit 1
+          fi
+          echo "Repository Latest release correctly preserved as CLI $latest_cli"
