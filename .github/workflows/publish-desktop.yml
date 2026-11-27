@@ -38,16 +38,16 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Desktop release tag to publish (desktop-vX.Y.Z)"
+        description: "Desktop release tag to publish (desktop-vX.Y.Z or one-desktop-vX.Y.Z)"
         required: true
         type: string
       source_ref:
-        description: "Source git ref in private repo (optional; default: tag, allows vX.Y.Z or desktop-vX.Y.Z+build)"
+        description: "Source git ref in private repo (optional; default: tag)"
         required: false
         default: ""
         type: string
       run_id:
-        description: "desktop-release workflow run ID in private source repository"
+        description: "desktop-release or one-desktop-release workflow run ID in private source repository"
         required: true
         type: string
       dry_run:
@@ -96,10 +96,27 @@ jobs:
           ALLOW_ROLLBACK: ${{ inputs.allow_rollback_floor }}
         run: |
           set -euo pipefail
-          if [[ ! "$TAG" =~ ^desktop-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "::error::tag must be desktop-vX.Y.Z"; exit 1
+          if [[ "$TAG" =~ ^desktop-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            product="code"
+            version="${TAG#desktop-v}"
+            workflow_path=".github/workflows/desktop-release.yml"
+            artifact_name="desktop-release-bundle"
+            app_prefix="Engra"
+            stable_tag="desktop-stable"
+            release_title="Engra Desktop $TAG"
+            stable_title="Engra Desktop Stable Updater Channel"
+          elif [[ "$TAG" =~ ^one-desktop-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            product="one"
+            version="${TAG#one-desktop-v}"
+            workflow_path=".github/workflows/one-desktop-release.yml"
+            artifact_name="one-desktop-release-bundle"
+            app_prefix="Engra_One"
+            stable_tag="one-desktop-stable"
+            release_title="Engra One Desktop $TAG"
+            stable_title="Engra One Desktop Stable Updater Channel"
+          else
+            echo "::error::tag must be desktop-vX.Y.Z or one-desktop-vX.Y.Z"; exit 1
           fi
-          version="${TAG#desktop-v}"
           if [[ -z "$RUN_ID" || ! "$RUN_ID" =~ ^[0-9]+$ ]]; then
             echo "::error::run_id must be numeric"; exit 1
           fi
@@ -110,13 +127,27 @@ jobs:
             echo "::error::allow_rollback_floor must be boolean (true or false)"; exit 1
           fi
           effective_source_ref="${SOURCE_REF:-$TAG}"
-          if [[ ! "$effective_source_ref" =~ ^(v${version}|desktop-v${version}(\+[0-9A-Za-z.-]+)?)$ ]]; then
-            echo "::error::source_ref must be desktop-v${version}, desktop-v${version}+<build>, or v${version}"
-            exit 1
+          if [[ "$product" == "one" ]]; then
+            if [[ ! "$effective_source_ref" =~ ^one-desktop-v${version}(\+[0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::source_ref must be one-desktop-v${version} or one-desktop-v${version}+<build>"
+              exit 1
+            fi
+          else
+            if [[ ! "$effective_source_ref" =~ ^(v${version}|desktop-v${version}(\+[0-9A-Za-z.-]+)?)$ ]]; then
+              echo "::error::source_ref must be desktop-v${version}, desktop-v${version}+<build>, or v${version}"
+              exit 1
+            fi
           fi
           {
             echo "tag=$TAG"
+            echo "product=$product"
             echo "version=$version"
+            echo "workflow_path=$workflow_path"
+            echo "artifact_name=$artifact_name"
+            echo "app_prefix=$app_prefix"
+            echo "stable_tag=$stable_tag"
+            echo "release_title=$release_title"
+            echo "stable_title=$stable_title"
             echo "source_ref=$effective_source_ref"
             echo "run_id=$RUN_ID"
             echo "dry_run=$DRY_RUN"
@@ -188,6 +219,7 @@ jobs:
           SRC: ${{ secrets.ENGRA_SOURCE_REPO }}
           SOURCE_REF: ${{ steps.inputs.outputs.source_ref }}
           RUN_ID: ${{ steps.inputs.outputs.run_id }}
+          WORKFLOW_PATH: ${{ steps.inputs.outputs.workflow_path }}
         run: |
           set -euo pipefail
           if [[ -z "${SRC:-}" || -z "${GH_TOKEN:-}" ]]; then
@@ -202,12 +234,12 @@ jobs:
             commit="$obj_sha"
           fi
           gh api "repos/$SRC/actions/runs/$RUN_ID" >run.json
-          jq -e --arg ref "$SOURCE_REF" --arg sha "$commit" '
-            .path == ".github/workflows/desktop-release.yml" and
+          jq -e --arg ref "$SOURCE_REF" --arg sha "$commit" --arg wf "$WORKFLOW_PATH" '
+            .path == $wf and
             .event == "push" and .head_branch == $ref and
             .status == "completed" and .conclusion == "success" and
             .head_sha == $sha' run.json >/dev/null || {
-            echo "::error::run $RUN_ID is not a successful desktop-release tag-push run of $SOURCE_REF at commit $commit"
+            echo "::error::run $RUN_ID is not a successful $WORKFLOW_PATH tag-push run of $SOURCE_REF at commit $commit"
             exit 1
           }
           # The source commit must be on main: main is identical to or ahead of it.
@@ -228,11 +260,14 @@ jobs:
           GH_TOKEN: ${{ steps.source_app.outputs.token || secrets.ENGRA_SOURCE_READ_TOKEN }}
           SRC: ${{ secrets.ENGRA_SOURCE_REPO }}
           RUN_ID: ${{ steps.source.outputs.run_id }}
-        run: gh run download "$RUN_ID" --repo "$SRC" --name desktop-release-bundle --dir bundle
+          ARTIFACT_NAME: ${{ steps.inputs.outputs.artifact_name }}
+        run: gh run download "$RUN_ID" --repo "$SRC" --name "$ARTIFACT_NAME" --dir bundle
 
       - name: Verify the desktop release bundle
         env:
           SRC: ${{ secrets.ENGRA_SOURCE_REPO }}
+          PRODUCT: ${{ steps.inputs.outputs.product }}
+          APP_PREFIX: ${{ steps.inputs.outputs.app_prefix }}
           VERSION: ${{ steps.inputs.outputs.version }}
           COMMIT: ${{ steps.source.outputs.commit }}
           PUBKEY_BASE64: ${{ env.PUBKEY_BASE64 }}
@@ -244,6 +279,7 @@ jobs:
 
           # 1. Distribution validator check for desktop-assets (and SHA256SUMS confinement/completeness)
           python3 scripts/check_distribution.py desktop-assets \
+            --product "$PRODUCT" \
             --version "$VERSION" \
             --dir bundle \
             --print0 assets.list \
@@ -304,11 +340,12 @@ jobs:
           latest_data = json.loads(latest_path.read_text(encoding="utf-8"))
           latest_platforms = latest_data.get("platforms") or {}
 
+          app_prefix = os.environ["APP_PREFIX"]
           updater_target_map = {
-              "darwin-aarch64": f"Engra_{version}_aarch64.app.tar.gz",
-              "darwin-x86_64": f"Engra_{version}_x64.app.tar.gz",
-              "windows-x86_64": f"Engra_{version}_x64-setup.exe",
-              "linux-x86_64": f"Engra_{version}_amd64.AppImage",
+              "darwin-aarch64": f"{app_prefix}_{version}_aarch64.app.tar.gz",
+              "darwin-x86_64": f"{app_prefix}_{version}_x64.app.tar.gz",
+              "windows-x86_64": f"{app_prefix}_{version}_x64-setup.exe",
+              "linux-x86_64": f"{app_prefix}_{version}_amd64.AppImage",
           }
 
           for target_key, target_name in updater_target_map.items():
@@ -378,6 +415,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.inputs.outputs.tag }}
+          STABLE_TAG: ${{ steps.inputs.outputs.stable_tag }}
           VERSION: ${{ steps.inputs.outputs.version }}
           SOURCE_REF: ${{ steps.inputs.outputs.source_ref }}
           RUN_ID: ${{ steps.source.outputs.run_id }}
@@ -419,7 +457,6 @@ jobs:
           print("OIDC provenance signing claim verified for release-publish")
           '
 
-          STABLE_TAG="desktop-stable"
           has_stable=false
           cur_ver=""
 
@@ -429,19 +466,19 @@ jobs:
             has_stable=true
             if ! curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/$STABLE_TAG/latest.json" -o cur_latest.json; then
               if [[ "$ALLOW_ROLLBACK" != "true" ]]; then
-                echo "::error::Failed to download desktop-stable/latest.json; failing closed"
+                echo "::error::Failed to download ${STABLE_TAG}/latest.json; failing closed"
                 exit 1
               fi
             else
               cur_ver="$(jq -r '.version // empty' cur_latest.json)"
               rm -f cur_latest.json
               if [[ -z "$cur_ver" && "$ALLOW_ROLLBACK" != "true" ]]; then
-                echo "::error::desktop-stable/latest.json has missing or empty version; failing closed"
+                echo "::error::${STABLE_TAG}/latest.json has missing or empty version; failing closed"
                 exit 1
               fi
             fi
           elif [[ "$http_status" != "404" ]]; then
-            echo "::error::GitHub API error checking desktop-stable release (HTTP $http_status)"
+            echo "::error::GitHub API error checking $STABLE_TAG release (HTTP $http_status)"
             exit 1
           fi
 
@@ -519,10 +556,11 @@ jobs:
         if: steps.inputs.outputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          PRODUCT: ${{ steps.inputs.outputs.product }}
           VERSION: ${{ steps.inputs.outputs.version }}
         run: |
           set -euo pipefail
-          python3 scripts/check_distribution.py desktop-assets --version "$VERSION" --dir bundle --print0 assets.list
+          python3 scripts/check_distribution.py desktop-assets --product "$PRODUCT" --version "$VERSION" --dir bundle --print0 assets.list
           count=0
           while IFS= read -r -d '' f; do
             gh attestation verify "$f" \
@@ -540,11 +578,13 @@ jobs:
         if: steps.inputs.outputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          PRODUCT: ${{ steps.inputs.outputs.product }}
+          RELEASE_TITLE: ${{ steps.inputs.outputs.release_title }}
           TAG: ${{ steps.inputs.outputs.tag }}
           VERSION: ${{ steps.inputs.outputs.version }}
         run: |
           set -euo pipefail
-          python3 scripts/check_distribution.py desktop-assets --version "$VERSION" --dir bundle --print0 assets.list
+          python3 scripts/check_distribution.py desktop-assets --product "$PRODUCT" --version "$VERSION" --dir bundle --print0 assets.list
           assets=()
           while IFS= read -r -d '' f; do assets+=("$f"); done <assets.list
 
@@ -561,7 +601,7 @@ jobs:
               echo "Existing release $TAG author is $rel_author; deleting release object to recreate as github-actions[bot]"
               gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
               gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target main \
-                --title "Engra Desktop $TAG" --notes-file bundle/RELEASE_NOTES.md --latest=false \
+                --title "$RELEASE_TITLE" --notes-file bundle/RELEASE_NOTES.md --latest=false \
                 -- "${assets[@]}"
             else
               echo "Existing release $TAG author is github-actions[bot]; uploading assets with --clobber"
@@ -569,7 +609,7 @@ jobs:
             fi
           else
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target main \
-              --title "Engra Desktop $TAG" --notes-file bundle/RELEASE_NOTES.md --latest=false \
+              --title "$RELEASE_TITLE" --notes-file bundle/RELEASE_NOTES.md --latest=false \
               -- "${assets[@]}"
           fi
 
@@ -577,13 +617,15 @@ jobs:
         if: steps.inputs.outputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          PRODUCT: ${{ steps.inputs.outputs.product }}
+          APP_PREFIX: ${{ steps.inputs.outputs.app_prefix }}
           TAG: ${{ steps.inputs.outputs.tag }}
           VERSION: ${{ steps.inputs.outputs.version }}
           COMMIT: ${{ steps.source.outputs.commit }}
         run: |
           set -euo pipefail
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" >release.json
-          python3 scripts/check_distribution.py desktop-release --version "$VERSION" --json release.json
+          python3 scripts/check_distribution.py desktop-release --product "$PRODUCT" --version "$VERSION" --json release.json
           rm -f release.json
 
           base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
@@ -607,10 +649,10 @@ jobs:
           rm -f published-build-info.json
 
           updater_files=(
-            "Engra_${VERSION}_aarch64.app.tar.gz"
-            "Engra_${VERSION}_x64.app.tar.gz"
-            "Engra_${VERSION}_x64-setup.exe"
-            "Engra_${VERSION}_amd64.AppImage"
+            "${APP_PREFIX}_${VERSION}_aarch64.app.tar.gz"
+            "${APP_PREFIX}_${VERSION}_x64.app.tar.gz"
+            "${APP_PREFIX}_${VERSION}_x64-setup.exe"
+            "${APP_PREFIX}_${VERSION}_amd64.AppImage"
             "latest.json"
           )
 
@@ -633,15 +675,16 @@ jobs:
             echo "$name OK (hash and attestation verified)"
           done
 
-      - name: Update desktop-stable updater channel release
+      - name: Update stable updater channel release
         if: steps.inputs.outputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          STABLE_TAG: ${{ steps.inputs.outputs.stable_tag }}
+          STABLE_TITLE: ${{ steps.inputs.outputs.stable_title }}
           VERSION: ${{ steps.inputs.outputs.version }}
           ALLOW_ROLLBACK: ${{ steps.inputs.outputs.allow_rollback_floor }}
         run: |
           set -euo pipefail
-          STABLE_TAG="desktop-stable"
           has_stable=false
           stable_author=""
           current_ver=""
@@ -674,22 +717,22 @@ jobs:
               cur_tuple = parse_semver(cur_ver)
               if new_tuple < cur_tuple:
                   if not allow_rollback:
-                      sys.exit(f"::error::Rollback floor violation: new version {new_ver} < current desktop-stable version {cur_ver}. Set allow_rollback_floor=true to override.")
+                      sys.exit(f"::error::Rollback floor violation: new version {new_ver} < current stable version {cur_ver}. Set allow_rollback_floor=true to override.")
                   else:
                       print(f"::warning::Rollback allowed: {new_ver} < {cur_ver} with allow_rollback_floor=true")
               else:
                   print(f"Monotonic SemVer verified: {new_ver} >= {cur_ver}")
           else:
-              print(f"Initial desktop-stable release channel creation for {new_ver}")
+              print(f"Initial stable release channel creation for {new_ver}")
           EOF
 
           if [[ "$has_stable" != "true" || "$stable_author" != "github-actions[bot]" ]]; then
             if [[ "$has_stable" == "true" ]]; then
-              echo "Deleting non-bot desktop-stable release"
+              echo "Deleting non-bot $STABLE_TAG release"
               gh release delete "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
             fi
             gh release create "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" --target main \
-              --title "Engra Desktop Stable Updater Channel" \
+              --title "$STABLE_TITLE" \
               --notes "Signed stable Tauri updater channel manifest." \
               --prerelease \
               --latest=false \
@@ -699,18 +742,18 @@ jobs:
               bundle/latest.json bundle/SHA256SUMS
           fi
 
-          # Verify desktop-stable release author, prerelease flag, and asset uploaders
+          # Verify stable release author, prerelease flag, and asset uploaders
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" >stable-release.json
           jq -e '
             .author.login == "github-actions[bot]" and
             .prerelease == true and
             ([.assets[].name] | sort == ["SHA256SUMS", "latest.json"]) and
             ([.assets[].uploader.login] | all(. == "github-actions[bot]"))' stable-release.json >/dev/null || {
-            echo "::error::desktop-stable release author, prerelease flag, or asset uploader verification failed"
+            echo "::error::$STABLE_TAG release author, prerelease flag, or asset uploader verification failed"
             exit 1
           }
           rm -f stable-release.json
-          echo "desktop-stable updater channel release verified successfully"
+          echo "$STABLE_TAG updater channel release verified successfully"
 
           # Prove repository Latest release is preserved as CLI vX.Y.Z
           latest_cli="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')"
