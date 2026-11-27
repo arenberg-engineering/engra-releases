@@ -432,24 +432,34 @@ def check_repo(root: Path) -> None:
 # ── Desktop distribution checks ──────────────────────────────────────────────
 
 
-def expected_desktop_assets(version: str) -> list[str]:
+def _desktop_product_spec(product: str = "code") -> tuple[str, str, str]:
+    norm = product.strip().lower()
+    if norm == "code":
+        return "Engra", "desktop-v", "engra-desktop"
+    if norm == "one":
+        return "Engra_One", "one-desktop-v", "engra-one-desktop"
+    raise Reject(f"unsupported desktop product {product!r}")
+
+
+def expected_desktop_assets(version: str, *, product: str = "code") -> list[str]:
     if not VERSION_RE.fullmatch(version):
         raise Reject(f"bad version {version!r}")
+    prefix, _, _ = _desktop_product_spec(product)
     return sorted(
         [
-            f"Engra_{version}_aarch64.dmg",
-            f"Engra_{version}_aarch64.app.tar.gz",
-            f"Engra_{version}_aarch64.app.tar.gz.sig",
-            f"Engra_{version}_x64.dmg",
-            f"Engra_{version}_x64.app.tar.gz",
-            f"Engra_{version}_x64.app.tar.gz.sig",
-            f"Engra_{version}_x64-setup.exe",
-            f"Engra_{version}_x64-setup.exe.sig",
-            f"Engra_{version}_x64_en-US.msi",
-            f"Engra_{version}_amd64.deb",
-            f"Engra-{version}-1.x86_64.rpm",
-            f"Engra_{version}_amd64.AppImage",
-            f"Engra_{version}_amd64.AppImage.sig",
+            f"{prefix}_{version}_aarch64.dmg",
+            f"{prefix}_{version}_aarch64.app.tar.gz",
+            f"{prefix}_{version}_aarch64.app.tar.gz.sig",
+            f"{prefix}_{version}_x64.dmg",
+            f"{prefix}_{version}_x64.app.tar.gz",
+            f"{prefix}_{version}_x64.app.tar.gz.sig",
+            f"{prefix}_{version}_x64-setup.exe",
+            f"{prefix}_{version}_x64-setup.exe.sig",
+            f"{prefix}_{version}_x64_en-US.msi",
+            f"{prefix}_{version}_amd64.deb",
+            f"{prefix}-{version}-1.x86_64.rpm",
+            f"{prefix}_{version}_amd64.AppImage",
+            f"{prefix}_{version}_amd64.AppImage.sig",
             "latest.json",
             "SHA256SUMS",
             "signing-status.json",
@@ -459,28 +469,31 @@ def expected_desktop_assets(version: str) -> list[str]:
 
 
 UPDATER_FILENAMES = {
-    "darwin-aarch64": "Engra_{version}_aarch64.app.tar.gz",
-    "darwin-x86_64": "Engra_{version}_x64.app.tar.gz",
-    "windows-x86_64": "Engra_{version}_x64-setup.exe",
-    "linux-x86_64": "Engra_{version}_amd64.AppImage",
+    "darwin-aarch64": "{prefix}_{version}_aarch64.app.tar.gz",
+    "darwin-x86_64": "{prefix}_{version}_x64.app.tar.gz",
+    "windows-x86_64": "{prefix}_{version}_x64-setup.exe",
+    "linux-x86_64": "{prefix}_{version}_amd64.AppImage",
 }
 _SHA256SUMS_LINE_RE = re.compile(r"^([0-9a-f]{64})  \*?([A-Za-z0-9._-]+)$", re.ASCII)
 
 
-def check_desktop_build_info(data: bytes, version: str) -> None:
+def check_desktop_build_info(
+    data: bytes, version: str, *, product: str = "code"
+) -> None:
+    _, tag_prefix, expected_product = _desktop_product_spec(product)
     try:
         info = json.loads(data)
     except Exception as exc:
         raise Reject(f"build-info.json: invalid JSON: {exc}") from exc
     if not isinstance(info, dict):
         raise Reject("build-info.json: root must be a JSON object")
-    if info.get("product") != "engra-desktop":
+    if info.get("product") != expected_product:
         raise Reject(
-            f"build-info.json: product {info.get('product')!r} != 'engra-desktop'"
+            f"build-info.json: product {info.get('product')!r} != {expected_product!r}"
         )
     if info.get("version") != version:
         raise Reject(f"build-info.json: version {info.get('version')!r} != {version!r}")
-    expected_tag = f"desktop-v{version}"
+    expected_tag = f"{tag_prefix}{version}"
     if info.get("tag") != expected_tag:
         raise Reject(f"build-info.json: tag {info.get('tag')!r} != {expected_tag!r}")
     commit = info.get("source_commit")
@@ -494,7 +507,10 @@ def check_desktop_build_info(data: bytes, version: str) -> None:
         )
 
 
-def check_desktop_latest_manifest(data: bytes, version: str) -> None:
+def check_desktop_latest_manifest(
+    data: bytes, version: str, *, product: str = "code"
+) -> None:
+    prefix, tag_prefix, _ = _desktop_product_spec(product)
     try:
         info = json.loads(data)
     except Exception as exc:
@@ -520,8 +536,8 @@ def check_desktop_latest_manifest(data: bytes, version: str) -> None:
         if not isinstance(p_info, dict):
             raise Reject(f"latest.json: platforms[{target!r}] must be a JSON object")
         url = p_info.get("url")
-        expected_fn = UPDATER_FILENAMES[target].format(version=version)
-        expected_url = f"https://github.com/arenberg-engineering/engra-releases/releases/download/desktop-v{version}/{expected_fn}"
+        expected_fn = UPDATER_FILENAMES[target].format(prefix=prefix, version=version)
+        expected_url = f"https://github.com/arenberg-engineering/engra-releases/releases/download/{tag_prefix}{version}/{expected_fn}"
         if url != expected_url:
             raise Reject(
                 f"latest.json: platforms[{target!r}].url {url!r} != {expected_url!r}"
@@ -533,7 +549,10 @@ def check_desktop_latest_manifest(data: bytes, version: str) -> None:
             )
 
 
-def check_desktop_signing_status(data: bytes, version: str) -> None:
+def check_desktop_signing_status(
+    data: bytes, version: str, *, product: str = "code"
+) -> None:
+    _, tag_prefix, _ = _desktop_product_spec(product)
     try:
         info = json.loads(data)
     except Exception as exc:
@@ -544,7 +563,7 @@ def check_desktop_signing_status(data: bytes, version: str) -> None:
         raise Reject(
             f"signing-status.json: version {info.get('version')!r} != {version!r}"
         )
-    expected_tag = f"desktop-v{version}"
+    expected_tag = f"{tag_prefix}{version}"
     if info.get("tag") != expected_tag:
         raise Reject(
             f"signing-status.json: tag {info.get('tag')!r} != {expected_tag!r}"
@@ -579,7 +598,10 @@ def check_desktop_signing_status(data: bytes, version: str) -> None:
             )
 
 
-def check_desktop_sha256sums(directory: Path, version: str) -> None:
+def check_desktop_sha256sums(
+    directory: Path, version: str, *, product: str = "code"
+) -> None:
+    prefix, _, _ = _desktop_product_spec(product)
     sums_path = directory / "SHA256SUMS"
     if not sums_path.is_file() or sums_path.is_symlink():
         raise Reject("missing or not a regular file: SHA256SUMS")
@@ -591,7 +613,7 @@ def check_desktop_sha256sums(directory: Path, version: str) -> None:
     if not lines:
         raise Reject("SHA256SUMS is empty")
 
-    allowed = set(expected_desktop_assets(version)) - {"SHA256SUMS"}
+    allowed = set(expected_desktop_assets(version, product=product)) - {"SHA256SUMS"}
     listed: dict[str, str] = {}
     for ln in lines:
         m = _SHA256SUMS_LINE_RE.fullmatch(ln)
@@ -608,19 +630,19 @@ def check_desktop_sha256sums(directory: Path, version: str) -> None:
     v_tuple = (v_parts[0], v_parts[1], v_parts[2])
 
     baseline_10 = {
-        f"Engra_{version}_aarch64.dmg",
-        f"Engra_{version}_aarch64.app.tar.gz",
-        f"Engra_{version}_x64.dmg",
-        f"Engra_{version}_x64.app.tar.gz",
-        f"Engra_{version}_x64-setup.exe",
-        f"Engra_{version}_x64_en-US.msi",
-        f"Engra_{version}_amd64.deb",
-        f"Engra-{version}-1.x86_64.rpm",
-        f"Engra_{version}_amd64.AppImage",
+        f"{prefix}_{version}_aarch64.dmg",
+        f"{prefix}_{version}_aarch64.app.tar.gz",
+        f"{prefix}_{version}_x64.dmg",
+        f"{prefix}_{version}_x64.app.tar.gz",
+        f"{prefix}_{version}_x64-setup.exe",
+        f"{prefix}_{version}_x64_en-US.msi",
+        f"{prefix}_{version}_amd64.deb",
+        f"{prefix}-{version}-1.x86_64.rpm",
+        f"{prefix}_{version}_amd64.AppImage",
         "latest.json",
     }
 
-    if v_tuple >= (0, 4, 67):
+    if v_tuple >= (0, 4, 67) or product == "one":
         if set(listed.keys()) != allowed:
             missing = sorted(allowed - set(listed.keys()))
             raise Reject(f"SHA256SUMS incomplete for v{version}: missing {missing!r}")
@@ -647,9 +669,13 @@ def check_desktop_sha256sums(directory: Path, version: str) -> None:
 
 
 def check_desktop_assets(
-    version: str, directory: Path, *, forbid_handle: str | None = None
+    version: str,
+    directory: Path,
+    *,
+    forbid_handle: str | None = None,
+    product: str = "code",
 ) -> list[str]:
-    names = expected_desktop_assets(version)
+    names = expected_desktop_assets(version, product=product)
     notes_path = directory / "RELEASE_NOTES.md"
     if not notes_path.is_file() or notes_path.is_symlink():
         raise Reject("missing or not a regular file: RELEASE_NOTES.md")
@@ -667,16 +693,16 @@ def check_desktop_assets(
             text_files.append(name)
             scan_bytes(name, data)
         if name == "build-info.json":
-            check_desktop_build_info(data, version)
+            check_desktop_build_info(data, version, product=product)
         elif name == "latest.json":
-            check_desktop_latest_manifest(data, version)
+            check_desktop_latest_manifest(data, version, product=product)
         elif name == "signing-status.json":
-            check_desktop_signing_status(data, version)
+            check_desktop_signing_status(data, version, product=product)
         elif name.endswith(".sig"):
             if not data.strip():
                 raise Reject(f"{name}: empty signature file")
 
-    check_desktop_sha256sums(directory, version)
+    check_desktop_sha256sums(directory, version, product=product)
 
     if forbid_handle:
         handle_lower = forbid_handle.strip().lower()
@@ -692,7 +718,10 @@ def check_desktop_assets(
     return names
 
 
-def check_desktop_release_json(version: str, json_path: Path) -> None:
+def check_desktop_release_json(
+    version: str, json_path: Path, *, product: str = "code"
+) -> None:
+    _, tag_prefix, _ = _desktop_product_spec(product)
     try:
         release = json.loads(json_path.read_text(encoding="utf-8"))
     except Exception as exc:
@@ -700,7 +729,7 @@ def check_desktop_release_json(version: str, json_path: Path) -> None:
     if not isinstance(release, dict):
         raise Reject("desktop release JSON: root must be a JSON object")
 
-    expected_tag = f"desktop-v{version}"
+    expected_tag = f"{tag_prefix}{version}"
     tag_name = release.get("tag_name")
     if tag_name != expected_tag:
         raise Reject(f"desktop release tag_name {tag_name!r} != {expected_tag!r}")
@@ -737,7 +766,7 @@ def check_desktop_release_json(version: str, json_path: Path) -> None:
                 f"desktop release asset {a.get('name')!r} uploader {uploader!r} != 'github-actions[bot]'"
             )
 
-    expected = set(expected_desktop_assets(version))
+    expected = set(expected_desktop_assets(version, product=product))
     extra = sorted(set(names) - expected)
     missing = sorted(expected - set(names))
     if extra or missing:
@@ -845,13 +874,14 @@ def _write_valid_bundle(d: Path, version: str, *, onedir: bool = False) -> None:
 
 
 def _write_valid_desktop_bundle(
-    d: Path, version: str, *, full_sums: bool = True
+    d: Path, version: str, *, full_sums: bool = True, product: str = "code"
 ) -> None:
-    expected = expected_desktop_assets(version)
+    prefix, tag_prefix, expected_product = _desktop_product_spec(product)
+    expected = expected_desktop_assets(version, product=product)
     pub_date = "2026-11-25T12:00:00Z"
     expires_at = "2026-12-09T12:00:00Z"
     (d / "RELEASE_NOTES.md").write_text(
-        f"# Engra Desktop v{version}\n\nNotes.\n", encoding="utf-8"
+        f"# {prefix} Desktop v{version}\n\nNotes.\n", encoding="utf-8"
     )
     for name in expected:
         if name == "SHA256SUMS":
@@ -860,9 +890,9 @@ def _write_valid_desktop_bundle(
             (d / name).write_text(
                 json.dumps(
                     {
-                        "product": "engra-desktop",
+                        "product": expected_product,
                         "version": version,
-                        "tag": f"desktop-v{version}",
+                        "tag": f"{tag_prefix}{version}",
                         "source_commit": "0123456789abcdef0123456789abcdef01234567",
                         "release": True,
                         "built_at": pub_date,
@@ -878,26 +908,26 @@ def _write_valid_desktop_bundle(
                 json.dumps(
                     {
                         "version": version,
-                        "notes": "Engra Desktop Workstation",
+                        "notes": "Engra Desktop",
                         "pub_date": pub_date,
                         "expires_at": expires_at,
                         "min_security_floor": "0.4.38",
                         "channel": "stable",
                         "platforms": {
                             "darwin-aarch64": {
-                                "url": f"https://github.com/arenberg-engineering/engra-releases/releases/download/desktop-v{version}/Engra_{version}_aarch64.app.tar.gz",
+                                "url": f"https://github.com/arenberg-engineering/engra-releases/releases/download/{tag_prefix}{version}/{prefix}_{version}_aarch64.app.tar.gz",
                                 "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZwo=",
                             },
                             "darwin-x86_64": {
-                                "url": f"https://github.com/arenberg-engineering/engra-releases/releases/download/desktop-v{version}/Engra_{version}_x64.app.tar.gz",
+                                "url": f"https://github.com/arenberg-engineering/engra-releases/releases/download/{tag_prefix}{version}/{prefix}_{version}_x64.app.tar.gz",
                                 "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZwo=",
                             },
                             "windows-x86_64": {
-                                "url": f"https://github.com/arenberg-engineering/engra-releases/releases/download/desktop-v{version}/Engra_{version}_x64-setup.exe",
+                                "url": f"https://github.com/arenberg-engineering/engra-releases/releases/download/{tag_prefix}{version}/{prefix}_{version}_x64-setup.exe",
                                 "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZwo=",
                             },
                             "linux-x86_64": {
-                                "url": f"https://github.com/arenberg-engineering/engra-releases/releases/download/desktop-v{version}/Engra_{version}_amd64.AppImage",
+                                "url": f"https://github.com/arenberg-engineering/engra-releases/releases/download/{tag_prefix}{version}/{prefix}_{version}_amd64.AppImage",
                                 "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZwo=",
                             },
                         },
@@ -912,7 +942,7 @@ def _write_valid_desktop_bundle(
                 json.dumps(
                     {
                         "version": version,
-                        "tag": f"desktop-v{version}",
+                        "tag": f"{tag_prefix}{version}",
                         "updater_ed25519_key_id": "08F3E169207691F4",
                         "updater_signed_targets": [
                             "darwin-aarch64",
@@ -941,15 +971,15 @@ def _write_valid_desktop_bundle(
             (d / name).write_bytes(b"installer binary stub\n")
 
     baseline_10 = [
-        f"Engra_{version}_aarch64.dmg",
-        f"Engra_{version}_aarch64.app.tar.gz",
-        f"Engra_{version}_x64.dmg",
-        f"Engra_{version}_x64.app.tar.gz",
-        f"Engra_{version}_x64-setup.exe",
-        f"Engra_{version}_x64_en-US.msi",
-        f"Engra_{version}_amd64.deb",
-        f"Engra-{version}-1.x86_64.rpm",
-        f"Engra_{version}_amd64.AppImage",
+        f"{prefix}_{version}_aarch64.dmg",
+        f"{prefix}_{version}_aarch64.app.tar.gz",
+        f"{prefix}_{version}_x64.dmg",
+        f"{prefix}_{version}_x64.app.tar.gz",
+        f"{prefix}_{version}_x64-setup.exe",
+        f"{prefix}_{version}_x64_en-US.msi",
+        f"{prefix}_{version}_amd64.deb",
+        f"{prefix}-{version}-1.x86_64.rpm",
+        f"{prefix}_{version}_amd64.AppImage",
         "latest.json",
     ]
     target_names = (
@@ -1530,6 +1560,37 @@ def selftest() -> None:
                 f"desktop release JSON ({bad_label})",
                 lambda: check_desktop_release_json(desk_v, dd / "bad_rel.json"),
             )
+
+        # (s) Valid Engra One Desktop bundle & release JSON -> accepted, cross-product rejected.
+        one_v = "0.4.71"
+        dd_one = d / "one_desktop"
+        dd_one.mkdir()
+        _write_valid_desktop_bundle(dd_one, one_v, full_sums=True, product="one")
+        check_desktop_assets(one_v, dd_one, forbid_handle="someone", product="one")
+        must_fail(
+            "one-desktop bundle checked as code product",
+            lambda: check_desktop_assets(one_v, dd_one, product="code"),
+        )
+        expected_one = expected_desktop_assets(one_v, product="one")
+        valid_one_rel = {
+            "tag_name": f"one-desktop-v{one_v}",
+            "draft": False,
+            "prerelease": False,
+            "author": {"login": "github-actions[bot]"},
+            "assets": [
+                {"name": n, "uploader": {"login": "github-actions[bot]"}}
+                for n in expected_one
+            ],
+        }
+        (dd_one / "rel.json").write_text(json.dumps(valid_one_rel), encoding="utf-8")
+        check_desktop_release_json(one_v, dd_one / "rel.json", product="one")
+        must_fail(
+            "one-desktop release JSON checked as code product",
+            lambda: check_desktop_release_json(
+                one_v, dd_one / "rel.json", product="code"
+            ),
+        )
+        print("[selftest] valid Engra One Desktop bundle & release JSON accepted")
     print("[selftest] OK")
 
 
@@ -1549,9 +1610,11 @@ def main(argv: list[str] | None = None) -> int:
     da.add_argument("--dir", required=True)
     da.add_argument("--print0", help="write the NUL-separated asset paths here")
     da.add_argument("--forbid-handle", help="forbidden source repository owner handle")
+    da.add_argument("--product", choices=("code", "one"), default="code")
     dr = sub.add_parser("desktop-release")
     dr.add_argument("--version", required=True)
     dr.add_argument("--json", required=True)
+    dr.add_argument("--product", choices=("code", "one"), default="code")
     sub.add_parser("selftest")
     args = parser.parse_args(argv)
     try:
@@ -1574,19 +1637,24 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "desktop-assets":
             directory = Path(args.dir)
             names = check_desktop_assets(
-                args.version, directory, forbid_handle=args.forbid_handle
+                args.version,
+                directory,
+                forbid_handle=args.forbid_handle,
+                product=args.product,
             )
             if args.print0:
                 Path(args.print0).write_bytes(
                     b"".join(str(directory / n).encode() + b"\0" for n in names)
                 )
             print(
-                f"[check] {len(names)} desktop release assets for {args.version} are clean"
+                f"[check] {len(names)} desktop release assets ({args.product}) for {args.version} are clean"
             )
         elif args.command == "desktop-release":
-            check_desktop_release_json(args.version, Path(args.json))
+            check_desktop_release_json(
+                args.version, Path(args.json), product=args.product
+            )
             print(
-                f"[check] published desktop release holds exactly the {args.version} asset set"
+                f"[check] published desktop release ({args.product}) holds exactly the {args.version} asset set"
             )
         else:
             selftest()
